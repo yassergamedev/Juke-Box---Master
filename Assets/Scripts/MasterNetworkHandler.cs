@@ -291,6 +291,7 @@ public class MasterNetworkHandler : MonoBehaviour
     {
         await SendRequestToSlave("PAUSE_RESUME");
     }
+    
     public async Task PlayNextSong()
     {
         await SendRequestToSlave("NEXT_SONG");

@@ -395,6 +395,10 @@ PrefabInstance:
       propertyPath: m_Name
       value: Song Queue
       objectReference: {fileID: 0}
+    - target: {fileID: 8623019846189571613, guid: 31831c9989e79c94082f6bc2028e60de, type: 3}
+      propertyPath: m_IsActive
+      value: 0
+      objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects:
     - {fileID: 6192379518857017618, guid: 31831c9989e79c94082f6bc2028e60de, type: 3}

@@ -1,4 +1,4 @@
-import { WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { MongoClient } from 'mongodb';
 import express from 'express';
 import cors from 'cors';
@@ -8,7 +8,7 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 const mongoUrl1 = "mongodb+srv://mezragyasser2002:mezrag.yasser123...@8bbjukebox.w1btiwn.mongodb.net/";
-const mongoUrl = "mongodb+srv://dbuser:dbuser@cluster0.qlpwlae.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
+const mongoUrl = "mongodb+srv://8bbjukebox:8bbjukebox123...@8bbjukebox.w1btiwn.mongodb.net/?retryWrites=true&w=majority&appName=8bbJukebox";
 
 let clients = new Set();
 let db = null;
@@ -32,39 +32,7 @@ async function connectToMongoDB() {
         changeStream.on('change', async (change) => {
             console.log('🔄 MongoDB change detected:', change.operationType);
             
-            // Check if this is a new song that needs validation
-            if (change.operationType === 'insert' && change.fullDocument?.existsAtMaster === false) {
-                console.log('🔍 New song needs validation:', {
-                    title: change.fullDocument.title,
-                    artist: change.fullDocument.artist,
-                    album: change.fullDocument.album,
-                    tracklistId: change.fullDocument._id
-                });
-                
-                // Send validation request to master
-                const validationMessage = JSON.stringify({
-                    type: 'validation_request',
-                    tracklistId: change.fullDocument._id,
-                    title: change.fullDocument.title || 'Unknown Song',
-                    artist: change.fullDocument.artist || 'Unknown Artist',
-                    album: change.fullDocument.album || 'Unknown Album',
-                    timestamp: new Date().toISOString()
-                });
-                
-                console.log('📤 Sending validation request:', validationMessage);
-                
-                // Send to master clients only (you can add client type identification later)
-                clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(validationMessage);
-                    }
-                });
-                
-                // Don't broadcast the insert yet - wait for validation
-                return;
-            }
-            
-            // Broadcast to all WebSocket clients (for validated songs or other operations)
+            // Broadcast to all WebSocket clients for all operations
             const message = JSON.stringify({
                 operationType: change.operationType,
                 songId: change.fullDocument?._id,
@@ -222,6 +190,23 @@ app.post('/api/pause', async (req, res) => {
             { $set: { status: 'paused', pausedAt: new Date() } }
         );
         console.log('[API] /api/pause -> Paused', { _id: currentSong._id, title: currentSong.title });
+        
+        // Broadcast explicit PAUSE command to all WebSocket clients
+        const pauseMessage = JSON.stringify({
+            operationType: 'pause',
+            songId: currentSong._id,
+            songTitle: currentSong.title,
+            status: 'paused',
+            timestamp: new Date().toISOString()
+        });
+        
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(pauseMessage);
+            }
+        });
+        
+        console.log('[API] /api/pause -> Broadcasted PAUSE command to clients');
         res.json({ success: true, message: 'Song paused' });
     } catch (error) {
         console.error('Error pausing song:', error);
@@ -253,6 +238,23 @@ app.post('/api/resume', async (req, res) => {
             { $set: { status: 'playing', resumedAt: new Date() } }
         );
         console.log('[API] /api/resume -> Resumed', { _id: pausedSong._id, title: pausedSong.title });
+        
+        // Broadcast explicit RESUME command to all WebSocket clients
+        const resumeMessage = JSON.stringify({
+            operationType: 'resume',
+            songId: pausedSong._id,
+            songTitle: pausedSong.title,
+            status: 'playing',
+            timestamp: new Date().toISOString()
+        });
+        
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(resumeMessage);
+            }
+        });
+        
+        console.log('[API] /api/resume -> Broadcasted RESUME command to clients');
         res.json({ success: true, message: 'Song resumed' });
     } catch (error) {
         console.error('Error resuming song:', error);
@@ -278,12 +280,9 @@ app.post('/api/skip', async (req, res) => {
             return res.status(404).json({ error: 'No song currently playing' });
         }
 
-        // Mark current song as skipped
-        await tracklistCollection.updateOne(
-            { _id: currentSong._id },
-            { $set: { status: 'skipped', skippedAt: new Date() } }
-        );
-        console.log('[API] /api/skip -> Skipped', { _id: currentSong._id, title: currentSong.title });
+        // Remove current song from tracklist entirely instead of marking as skipped
+        await tracklistCollection.deleteOne({ _id: currentSong._id });
+        console.log('[API] /api/skip -> Deleted', { _id: currentSong._id, title: currentSong.title });
 
         // Find next queued song
         const nextSong = await tracklistCollection.findOne(

@@ -7,8 +7,8 @@ import { createServer } from 'http';
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
-const mongoUrl = "mongodb+srv://mezragyasser2002:mezrag.yasser123...@8bbjukebox.w1btiwn.mongodb.net/";
-
+//const mongoUrl = "mongodb+srv://mezragyasser2002:mezrag.yasser123...@8bbjukebox.w1btiwn.mongodb.net/";
+const mongoUrl = "mongodb+srv://8bbjukebox:8bbjukebox123...@8bbjukebox.w1btiwn.mongodb.net/?retryWrites=true&w=majority&appName=8bbJukebox";
 let clients = new Set();
 let db = null;
 let changeStream = null;
@@ -35,46 +35,8 @@ async function connectToMongoDB() {
             console.log('📡 Tracklist change detected:', {
                 operationType: change.operationType,
                 documentId: change.documentKey?._id,
-                fullDocument: change.fullDocument ? {
-                    title: change.fullDocument.title,
-                    artist: change.fullDocument.artist,
-                    status: change.fullDocument.status,
-                    album: change.fullDocument.album,
-                    existsAtMaster: change.fullDocument.existsAtMaster
-                } : null
+                timestamp: new Date().toISOString()
             });
-            
-            // Check if this is a new song that needs validation
-            if (change.operationType === 'insert' && change.fullDocument?.existsAtMaster === false) {
-                console.log('🔍 New song needs validation:', {
-                    title: change.fullDocument.title,
-                    artist: change.fullDocument.artist,
-                    album: change.fullDocument.album,
-                    tracklistId: change.fullDocument._id
-                });
-                
-                // Send validation request to master
-                const validationMessage = JSON.stringify({
-                    type: 'validation_request',
-                    tracklistId: change.fullDocument._id,
-                    title: change.fullDocument.title || 'Unknown Song',
-                    artist: change.fullDocument.artist || 'Unknown Artist',
-                    album: change.fullDocument.album || 'Unknown Album',
-                    timestamp: new Date().toISOString()
-                });
-                
-                console.log('📤 Sending validation request:', validationMessage);
-                
-                // Send to master clients only (you can add client type identification later)
-                clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(validationMessage);
-                    }
-                });
-                
-                // Don't broadcast the insert yet - wait for validation
-                return;
-            }
             
             let documentData = change.fullDocument;
             
@@ -95,57 +57,55 @@ async function connectToMongoDB() {
                     });
                 } catch (error) {
                     console.error('❌ Error fetching document:', error);
+                    return;
                 }
             }
             
-            // Check if this is a new song that needs validation
-            if (change.operationType === 'insert' && documentData?.existsAtMaster === false) {
-                console.log('🔍 New song needs validation:', {
-                    title: documentData.title,
-                    artist: documentData.artist,
-                    album: documentData.album,
-                    tracklistId: change.documentKey._id
-                });
-                
-                // Send validation request to master
-                broadcastValidationRequest({
-                    tracklistId: change.documentKey._id,
-                    title: documentData.title,
-                    artist: documentData.artist,
-                    album: documentData.album
+            // For delete operations, we can't get the document data since it's already deleted
+            if (change.operationType === 'delete') {
+                console.log('🗑️ Document deleted:', {
+                    documentId: change.documentKey?._id,
+                    operationType: 'delete'
                 });
             }
             
-            // Create broadcast message using the provided format
+            // Create broadcast message
             const update = {
                 operationType: change.operationType,
-                songTitle: documentData?.title || 'Unknown Song',
-                status: documentData?.status || 'unknown',
+                songTitle: documentData?.title || (change.operationType === 'delete' ? 'Deleted Song' : 'Unknown Song'),
+                status: documentData?.status || (change.operationType === 'delete' ? 'deleted' : 'unknown'),
                 songId: change.documentKey?._id,
-                artist: documentData?.artist || 'Unknown Artist',
-                album: documentData?.album || 'Unknown Album',
+                artist: documentData?.artist || (change.operationType === 'delete' ? 'Deleted Artist' : 'Unknown Artist'),
+                album: documentData?.album || (change.operationType === 'delete' ? 'Deleted Album' : 'Unknown Album'),
                 duration: documentData?.duration || documentData?.length || 0,
                 priority: documentData?.priority || 1,
                 requestedBy: documentData?.requestedBy || 'system',
                 masterId: documentData?.masterId || 'unknown',
-                existsAtMaster: documentData?.existsAtMaster || false
+                existsAtMaster: documentData?.existsAtMaster || false,
+                timestamp: new Date().toISOString()
             };
             
             // Add currentTime for playing songs
             if (documentData?.status === 'playing') {
-                update.currentTime = 0; // You can calculate actual current time here
+                update.currentTime = 0;
             }
             
             // Add songIndex for queue position
             if (change.operationType === 'insert' || change.operationType === 'update') {
-                update.songIndex = 0; // You can calculate actual queue position here
+                update.songIndex = 0;
             }
             
-            console.log('📤 Broadcasting update:', update);
+            console.log('📤 Broadcasting tracklist update:', {
+                operation: change.operationType,
+                song: update.songTitle,
+                status: update.status,
+                artist: update.artist,
+                album: update.album,
+                existsAtMaster: update.existsAtMaster
+            });
             
-            // Broadcast using the provided format
+            // Broadcast to all connected clients
             broadcastTracklistUpdate(update);
-            
         });
         
         changeStream.on('error', (error) => {
@@ -442,6 +402,23 @@ app.post('/api/pause', async (req, res) => {
         if (!doc) return res.status(404).json({ success: false, message: 'No song currently playing to pause' });
 
         await col.updateOne({ _id: doc._id }, { $set: { status: 'paused' } });
+        
+        // Broadcast explicit PAUSE command to all WebSocket clients
+        const pauseMessage = JSON.stringify({
+            operationType: 'pause',
+            songId: doc._id,
+            songTitle: doc.title || 'Unknown Song',
+            status: 'paused',
+            timestamp: new Date().toISOString()
+        });
+        
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(pauseMessage);
+            }
+        });
+        
+        console.log('[API] /api/pause -> Broadcasted PAUSE command to clients');
         return res.json({ success: true, message: 'Song paused', id: String(doc._id) });
     } catch (err) {
         console.error('[API] pause error', err);
@@ -474,6 +451,23 @@ app.post('/api/resume', async (req, res) => {
         if (!doc) return res.status(404).json({ success: false, message: 'No song currently paused to resume' });
 
         await col.updateOne({ _id: doc._id }, { $set: { status: 'playing' } });
+        
+        // Broadcast explicit RESUME command to all WebSocket clients
+        const resumeMessage = JSON.stringify({
+            operationType: 'resume',
+            songId: doc._id,
+            songTitle: doc.title || 'Unknown Song',
+            status: 'playing',
+            timestamp: new Date().toISOString()
+        });
+        
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(resumeMessage);
+            }
+        });
+        
+        console.log('[API] /api/resume -> Broadcasted RESUME command to clients');
         return res.json({ success: true, message: 'Song resumed', id: String(doc._id) });
     } catch (err) {
         console.error('[API] resume error', err);
@@ -505,8 +499,8 @@ app.post('/api/skip', async (req, res) => {
         }
         if (!doc) return res.status(404).json({ success: false, message: 'No song currently playing or paused to skip' });
 
-        await col.updateOne({ _id: doc._id }, { $set: { status: 'skipped' } });
-        return res.json({ success: true, message: 'Song skipped', id: String(doc._id) });
+        await col.deleteOne({ _id: doc._id });
+        return res.json({ success: true, message: 'Song deleted from tracklist', id: String(doc._id) });
     } catch (err) {
         console.error('[API] skip error', err);
         return res.status(500).json({ success: false, message: 'Internal error' });

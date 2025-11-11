@@ -3,6 +3,8 @@ using TMPro;
 using UnityEngine.UI;
 using UnityEngine.Networking;
 using System.Collections;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 public class Song : MonoBehaviour
 {
@@ -24,6 +26,10 @@ public class Song : MonoBehaviour
     public float SongLength { get; set; }
 
     public string KeypadInput { get; set; }
+    
+    // Reference to TrackQueueManager for proper song addition
+    private TrackQueueManager trackQueueManager;
+    private MongoDBManager mongoDBManager;
     public void Initialize(string songName, string artist, string audioClipPath, int number)
     {
         SongName = songName;
@@ -33,6 +39,10 @@ public class Song : MonoBehaviour
         NumberString = number.ToString();
         UpdateUI();
         audioSource = GetComponent<AudioSource>();
+
+        // Get references to managers
+        trackQueueManager = FindObjectOfType<TrackQueueManager>();
+        mongoDBManager = MongoDBManager.Instance;
 
         if (playButton != null)
         {
@@ -55,6 +65,10 @@ public class Song : MonoBehaviour
         UpdateUI();
         audioSource = GetComponent<AudioSource>();
 
+        // Get references to managers
+        trackQueueManager = FindObjectOfType<TrackQueueManager>();
+        mongoDBManager = MongoDBManager.Instance;
+
         if (playButton != null)
         {
             playButton.onClick.AddListener(PlayAudio);
@@ -71,6 +85,25 @@ public class Song : MonoBehaviour
         SetTextAndAdjustSize(songNameText, SongName);
         SetTextAndAdjustSize(artistText, Artist);
         SetTextAndAdjustSize(numberText, NumberString);
+        
+        // Disable raycasting on text components so clicks pass through to the button
+        DisableTextRaycasting();
+    }
+    
+    private void DisableTextRaycasting()
+    {
+        if (songNameText != null)
+        {
+            songNameText.raycastTarget = false;
+        }
+        if (artistText != null)
+        {
+            artistText.raycastTarget = false;
+        }
+        if (numberText != null)
+        {
+            numberText.raycastTarget = false;
+        }
     }
 
     private void SetTextAndAdjustSize(TMP_Text textComponent, string content)
@@ -82,22 +115,31 @@ public class Song : MonoBehaviour
 
     public void PlayAudio()
     {
-        if (audioSource != null)
+        Debug.Log($"[SONG] PlayAudio called for: {SongName}");
+        
+        if (trackQueueManager == null)
         {
-            if (AudioClip != null)
-            {
-                audioSource.clip = AudioClip;
-                audioSource.Play();
-            }
-            else
-            {
-                StartCoroutine(LoadAudioClipFromPath());
-            }
+            Debug.LogError("[SONG] TrackQueueManager not found!");
+            return;
         }
-        else
+        
+        // Find the parent album to get album number
+        Album parentAlbum = GetComponentInParent<Album>();
+        if (parentAlbum == null)
         {
-            Debug.LogWarning("AudioSource is missing.");
+            Debug.LogError($"[SONG] Could not find parent Album for song: {SongName}");
+            return;
         }
+        
+        // Generate keypad input format: "DD-DD" (album number - song number)
+        string albumNumberStr = parentAlbum.albumNumber.ToString("00");
+        string songNumberStr = Number.ToString("00");
+        string keypadInput = $"{albumNumberStr}-{songNumberStr}";
+        
+        Debug.Log($"[SONG] Generated keypad input: {keypadInput} for song: {SongName} (Album: {parentAlbum.albumNumber}, Song: {Number})");
+        
+        // Use the existing AddSongToQueue method with the keypad input
+        _ = trackQueueManager.AddSongToQueue(keypadInput, "user");
     }
 
     public IEnumerator LoadAudioClipFromPath()

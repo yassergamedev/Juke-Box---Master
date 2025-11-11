@@ -329,7 +329,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   m_Content: {fileID: 3026209662791694111}
   m_Horizontal: 0
-  m_Vertical: 1
+  m_Vertical: 0
   m_MovementType: 1
   m_Elasticity: 0.1
   m_Inertia: 1
@@ -418,8 +418,8 @@ MonoBehaviour:
   m_ChildAlignment: 0
   m_StartCorner: 0
   m_StartAxis: 1
-  m_CellSize: {x: 352.4, y: 170.9}
-  m_Spacing: {x: 53.3, y: 138.7}
+  m_CellSize: {x: 352.4, y: 140}
+  m_Spacing: {x: 53.3, y: 0}
   m_Constraint: 1
   m_ConstraintCount: 2
 --- !u!1 &5015751760321090047
@@ -458,8 +458,8 @@ RectTransform:
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 1, y: 1}
-  m_AnchoredPosition: {x: 0, y: 0}
-  m_SizeDelta: {x: 0, y: 27.2681}
+  m_AnchoredPosition: {x: -44.53798, y: 0}
+  m_SizeDelta: {x: 76.5768, y: 27.2681}
   m_Pivot: {x: 0, y: 1}
 --- !u!222 &8607784879282093253
 CanvasRenderer:

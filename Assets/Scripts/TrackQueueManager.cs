@@ -56,6 +56,14 @@ public class TrackQueueManager : MonoBehaviour
     [Header("Loading UI")]
     public Canvas loadingCanvas; // Canvas for loading UI
     public Transform loadingParent; // Parent transform for loading prefabs
+    
+    [Header("Friendly Songs UI")]
+    public Button chooseAlbumButton; // Button to select friendly songs folder
+    public Button playFriendlyButton; // Button to start playing friendly songs
+    public Button backToNormalButton; // Button to exit friendly mode and return to normal albums
+    
+    [Header("Album Management UI")]
+    public Button scanAlbumsButton; // Button to scan for new albums/songs and update MongoDB
 
 
     private int currentSongIndex;
@@ -81,6 +89,22 @@ public class TrackQueueManager : MonoBehaviour
     // Loading UI tracking
     private GameObject currentLoadingInstance;
     private Dictionary<GameObject, GameObject> activeLoadingInstances = new Dictionary<GameObject, GameObject>();
+    
+    // Simple auto-add tracking
+    private float timeSinceStartup = 0f;
+    private bool hasAddedStartupSong = false;
+    private float startupDelay = 5f; // 5 seconds after startup
+    
+    // Continuous queue monitoring
+    private float queueCheckTimer = 0f;
+    private float queueCheckInterval = 2f; // Check every 2 seconds
+    
+    // Auto-add cooldown to prevent multiple simultaneous additions
+    private float lastAutoAddTime = 0f;
+    private float autoAddCooldown = 5f; // 5 seconds cooldown between auto-adds
+    
+    // Friendly songs mode tracking
+    private bool isFriendlyMode = false;
     private void Start()
     {
         Debug.Log("[TRACKQUEUE] Starting TrackQueueManager...");
@@ -100,6 +124,12 @@ public class TrackQueueManager : MonoBehaviour
         }
         
         Debug.Log("[TRACKQUEUE] TrackQueueManager initialized successfully");
+
+        // Setup friendly songs button listeners
+        SetupFriendlySongsButtons();
+        
+        // Setup scan albums button listener
+        SetupScanAlbumsButton();
 
         // Keep running and playing audio when app is unfocused or in background
         Application.runInBackground = true;
@@ -173,6 +203,430 @@ public class TrackQueueManager : MonoBehaviour
                 }
             }
           
+        }
+        
+        // Auto-add random song if idle for 10 seconds on startup
+        if (!albumManager.isSlave) // Only for master
+        {
+            UpdateSimpleAutoAdd();
+        }
+    }
+    
+    private void UpdateSimpleAutoAdd()
+    {
+        timeSinceStartup += Time.deltaTime;
+        queueCheckTimer += Time.deltaTime;
+        
+        // Add random song 5 seconds after startup if queue is empty
+        if (timeSinceStartup > startupDelay && !hasAddedStartupSong && queueList.Count == 0)
+        {
+            Debug.Log("[TRACKQUEUE] 5 seconds passed with empty queue - adding random song");
+            AddRandomSongSimple();
+            hasAddedStartupSong = true; // Only trigger once
+        }
+        
+        // Continuous queue monitoring as backup (every 2 seconds)
+        if (queueCheckTimer > queueCheckInterval)
+        {
+            queueCheckTimer = 0f;
+            
+            if (queueList.Count == 0 && !albumManager.isSlave && CanAutoAdd())
+            {
+                Debug.Log("[TRACKQUEUE] Continuous monitoring detected empty queue - adding random song");
+                AddRandomSongSimple();
+            }
+        }
+    }
+    
+    private bool CanAutoAdd()
+    {
+        float timeSinceLastAdd = Time.time - lastAutoAddTime;
+        return timeSinceLastAdd >= autoAddCooldown;
+    }
+    
+    private void AddRandomSongSimple()
+    {
+        if (!CanAutoAdd())
+        {
+            float timeRemaining = autoAddCooldown - (Time.time - lastAutoAddTime);
+            Debug.Log($"[TRACKQUEUE] Auto-add on cooldown. Must wait {timeRemaining:F1}s more (cooldown: {autoAddCooldown}s)");
+            return;
+        }
+        
+        // Update cooldown timer BEFORE attempting to add (ensures 5-second wait)
+        lastAutoAddTime = Time.time;
+        Debug.Log($"[TRACKQUEUE] Auto-add allowed. Starting cooldown timer (next auto-add in {autoAddCooldown}s)");
+        AddRandomSongWithRetry(3); // Try up to 3 times
+    }
+    
+    private void AddRandomSongWithRetry(int maxRetries)
+    {
+        // If in friendly mode, use friendly songs instead
+        if (isFriendlyMode)
+        {
+            Debug.Log("[TRACKQUEUE] In friendly mode - adding friendly song");
+            AddRandomFriendlySong();
+            return;
+        }
+        
+        if (albumManager.albums.Count == 0)
+        {
+            Debug.LogWarning("[TRACKQUEUE] No albums available for random song selection");
+            return;
+        }
+        
+        if (string.IsNullOrEmpty(albumManager.AlbumBasePath) || !Directory.Exists(albumManager.AlbumBasePath))
+        {
+            Debug.LogError("[TRACKQUEUE] AlbumBasePath is not set or doesn't exist");
+            return;
+        }
+        
+        var random = new System.Random();
+        
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                // Pick a random album number within bounds (1-based indexing to match albumNumber)
+                int albumNumber = random.Next(1, albumManager.albums.Count + 1);
+                Album randomAlbum = albumManager.albums[albumNumber - 1];
+                
+                if (randomAlbum.Songs.Count == 0)
+                {
+                    Debug.LogWarning($"[TRACKQUEUE] Album {randomAlbum.albumName} has no songs (attempt {attempt})");
+                    continue;
+                }
+                
+                // Pick a random song number within bounds (1-based indexing)
+                int songNumber = random.Next(1, randomAlbum.Songs.Count + 1);
+                Song randomSong = randomAlbum.Songs[songNumber - 1];
+                
+                // Generate keypad input format: "DD-DD" (album number - song number)
+                string albumNumberStr = albumNumber.ToString("00");
+                string songNumberStr = songNumber.ToString("00");
+                string keypadInput = $"{albumNumberStr}-{songNumberStr}";
+                
+                Debug.Log($"[TRACKQUEUE] Auto-add attempt {attempt}: Generated keypad input {keypadInput} (Album: {randomAlbum.albumName}, Song index: {songNumber})");
+                
+                // Step 4: Check if the file actually exists in the albums directory BEFORE adding to tracklist
+                string songName = randomSong.SongName;
+                
+                // Find the album folder path
+                string albumFolderPath = albumManager.FindAlbumFolder(randomAlbum.albumName);
+                if (string.IsNullOrEmpty(albumFolderPath))
+                {
+                    Debug.LogWarning($"[TRACKQUEUE] Album folder not found for: {randomAlbum.albumName} (attempt {attempt})");
+                    continue;
+                }
+                
+                // Check if the song file exists
+                string songFilePath = albumManager.FindSongFilePath(albumFolderPath, songName);
+                if (string.IsNullOrEmpty(songFilePath) || !File.Exists(songFilePath))
+                {
+                    Debug.LogWarning($"[TRACKQUEUE] Song file not found: {songName} in album {randomAlbum.albumName} (attempt {attempt})");
+                    continue;
+                }
+                
+                // Step 5: File exists - now add to MongoDB tracklist using the normal procedure
+                Debug.Log($"[TRACKQUEUE] File verified exists: {songFilePath}. Adding to tracklist with keypad input: {keypadInput}");
+                _ = AddSongToQueue(keypadInput, "auto-add");
+                
+                // If we get here, the song was added successfully
+                Debug.Log($"[TRACKQUEUE] Successfully added random song on attempt {attempt}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[TRACKQUEUE] Failed to add random song on attempt {attempt}: {ex.Message}");
+                if (attempt == maxRetries)
+                {
+                    Debug.LogError($"[TRACKQUEUE] All {maxRetries} attempts failed to add random song");
+                }
+            }
+        }
+    }
+    
+    // New method for friendly songs using MongoDB system
+    public async void AddRandomFriendlySong()
+    {
+        Debug.Log("[TRACKQUEUE] Adding random friendly song...");
+        
+        string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+        if (string.IsNullOrEmpty(friendlyFolderPath) || !Directory.Exists(friendlyFolderPath))
+        {
+            Debug.LogError("[TRACKQUEUE] FriendlyAlbumsPath is not set or folder doesn't exist");
+            albumManager.UpdateDebugText("Please select a friendly songs folder first!");
+            return;
+        }
+        
+        try
+        {
+            // Get all friendly songs from MongoDB
+            var allSongs = await mongoDBManager.GetAllSongsAsync();
+            var friendlySongs = allSongs.Where(s => s.FamilyFriendly == true).ToList();
+            
+            if (friendlySongs.Count == 0)
+            {
+                Debug.LogWarning("[TRACKQUEUE] No friendly songs found in MongoDB");
+                albumManager.UpdateDebugText("No friendly songs found in database!");
+                return;
+            }
+            
+            // Pick a random friendly song
+            var random = new System.Random();
+            var randomSong = friendlySongs[random.Next(friendlySongs.Count)];
+            
+            Debug.Log($"[TRACKQUEUE] Selected random friendly song: {randomSong.Title} from album: {randomSong.Album}");
+            
+            // Find the album folder
+            string albumPath = albumManager.FindAlbumFolder(randomSong.Album);
+            if (string.IsNullOrEmpty(albumPath))
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Album folder not found for: {randomSong.Album}");
+                albumManager.UpdateDebugText($"Album folder not found for: {randomSong.Album}");
+                return;
+            }
+            
+            // Find the audio file
+            string audioPath = albumManager.FindSongFilePath(albumPath, randomSong.Title);
+            if (string.IsNullOrEmpty(audioPath))
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Audio file not found for: {randomSong.Title}");
+                albumManager.UpdateDebugText($"Audio file not found for: {randomSong.Title}");
+                return;
+            }
+            
+            // Get the song length
+            int songDuration = albumManager.GetAudioFileLength(audioPath);
+            if (songDuration <= 0)
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Could not get audio length for: {randomSong.Title}");
+                songDuration = 180; // Default duration
+            }
+            
+            Debug.Log($"[TRACKQUEUE] Adding friendly song to tracklist: {randomSong.Title}");
+            
+            // Add to MongoDB tracklist (this will trigger real-time updates)
+            string masterId = albumManager.isSlave ? "slave" : "master";
+            var tracklistEntry = await mongoDBManager.AddSongToTracklistAsync(
+                randomSong.Id,
+                randomSong.Title,
+                randomSong.Artist ?? "Unknown Artist",
+                randomSong.Album,
+                songDuration,
+                "friendly-mode",
+                masterId,
+                1 // Default priority
+            );
+            
+            if (tracklistEntry != null)
+            {
+                Debug.Log($"[TRACKQUEUE] Successfully added friendly song to tracklist: {randomSong.Title}");
+                albumManager.UpdateDebugText($"Added friendly song: {randomSong.Title}");
+            }
+            else
+            {
+                Debug.LogError($"[TRACKQUEUE] Failed to add friendly song to tracklist: {randomSong.Title}");
+                albumManager.UpdateDebugText($"Failed to add friendly song: {randomSong.Title}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error adding friendly song: {ex.Message}");
+            albumManager.UpdateDebugText($"Error adding friendly song: {ex.Message}");
+        }
+    }
+    
+    // Setup friendly songs button listeners
+    private void SetupFriendlySongsButtons()
+    {
+        if (chooseAlbumButton != null)
+        {
+            chooseAlbumButton.onClick.AddListener(OnChooseAlbumButtonClicked);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ChooseAlbumButton not assigned!");
+        }
+        
+        if (playFriendlyButton != null)
+        {
+            playFriendlyButton.onClick.AddListener(OnPlayFriendlyButtonClicked);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] PlayFriendlyButton not assigned!");
+        }
+        
+        if (backToNormalButton != null)
+        {
+            backToNormalButton.onClick.AddListener(OnBackToNormalButtonClicked);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] BackToNormalButton not assigned!");
+        }
+    }
+    
+    // Setup scan albums button listener
+    private void SetupScanAlbumsButton()
+    {
+        if (scanAlbumsButton != null)
+        {
+            scanAlbumsButton.onClick.AddListener(OnScanAlbumsButtonClicked);
+            Debug.Log("[TRACKQUEUE] ScanAlbumsButton listener set up");
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ScanAlbumsButton not assigned!");
+        }
+    }
+    
+    // Handle scan albums button click
+    private void OnScanAlbumsButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Scan Albums button clicked");
+        if (albumManager != null)
+        {
+            albumManager.ScanForAlbums();
+        }
+        else
+        {
+            Debug.LogError("[TRACKQUEUE] AlbumManager not found! Cannot scan albums.");
+        }
+    }
+    
+    // Handle choose album button click
+    private void OnChooseAlbumButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Choose Album button clicked");
+        albumManager.SelectSongsFolder();
+    }
+    
+    // Handle play friendly button click
+    private void OnPlayFriendlyButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Play Friendly button clicked");
+        StartFriendlyMode();
+    }
+    
+    // Handle back to normal button click
+    private void OnBackToNormalButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Back to Normal button clicked");
+        ExitFriendlyMode();
+    }
+    
+    // Exit friendly mode and return to normal albums
+    private async void ExitFriendlyMode()
+    {
+        Debug.Log("[TRACKQUEUE] Exiting friendly mode...");
+        
+        try
+        {
+            // Stop current playback
+            StopAllPlayback();
+            
+            // Clear current queue
+            ClearSongQueue();
+            
+            // Additional UI clearing - destroy any remaining song GameObjects
+            if (SongContainer != null)
+            {
+                foreach (Transform child in SongContainer)
+                {
+                    if (child != null)
+                    {
+                        Debug.Log($"[TRACKQUEUE] Destroying remaining UI element: {child.name}");
+                        Destroy(child.gameObject);
+                    }
+                }
+            }
+            
+            // Clear MongoDB tracklist
+            await mongoDBManager.ClearTracklistAsync();
+            
+            // Disable friendly mode
+            isFriendlyMode = false;
+            
+            Debug.Log("[TRACKQUEUE] Friendly mode disabled - returning to normal albums");
+            albumManager.UpdateDebugText("Returned to normal album mode");
+            
+            // Add first random song from normal albums
+            AddRandomSongSimple();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error exiting friendly mode: {ex.Message}");
+            albumManager.UpdateDebugText($"Error exiting friendly mode: {ex.Message}");
+        }
+    }
+    
+    // Start friendly mode - clear queue and start playing friendly songs
+    private async void StartFriendlyMode()
+    {
+        Debug.Log("[TRACKQUEUE] Starting friendly mode...");
+        
+        // Check if friendly folder is selected
+        string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+        if (string.IsNullOrEmpty(friendlyFolderPath) || !Directory.Exists(friendlyFolderPath))
+        {
+            Debug.LogError("[TRACKQUEUE] FriendlyAlbumsPath is not set or folder doesn't exist");
+            albumManager.UpdateDebugText("Please select a friendly songs folder first!");
+            return;
+        }
+        
+        try
+        {
+            // Stop ALL playback and coroutines
+            StopAllPlayback();
+            
+            // Stop any running playback coroutines
+            if (playbackCoroutine != null)
+            {
+                StopCoroutine(playbackCoroutine);
+                playbackCoroutine = null;
+            }
+            
+            // Stop audio source
+            if (audioSource != null)
+            {
+                audioSource.Stop();
+                audioSource.clip = null;
+            }
+            
+            // Clear current queue (this should destroy UI elements)
+            ClearSongQueue();
+            
+            // Additional UI clearing - destroy any remaining song GameObjects
+            if (SongContainer != null)
+            {
+                foreach (Transform child in SongContainer)
+                {
+                    if (child != null)
+                    {
+                        Debug.Log($"[TRACKQUEUE] Destroying remaining UI element: {child.name}");
+                        Destroy(child.gameObject);
+                    }
+                }
+            }
+            
+            // Clear MongoDB tracklist
+            await mongoDBManager.ClearTracklistAsync();
+            
+            // Enable friendly mode
+            isFriendlyMode = true;
+            
+            Debug.Log("[TRACKQUEUE] Friendly mode enabled - adding first friendly song");
+            albumManager.UpdateDebugText("Friendly mode started - adding songs...");
+            
+            // Add first friendly song
+            AddRandomFriendlySong();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error starting friendly mode: {ex.Message}");
+            albumManager.UpdateDebugText($"Error starting friendly mode: {ex.Message}");
         }
     }
 
@@ -549,21 +1003,14 @@ public class TrackQueueManager : MonoBehaviour
         var validationResult = new ValidationResult();
         yield return StartCoroutine(ValidateAndUpdateSongIfNeededCoroutine(song, validationResult));
         
-        try
+        if (validationResult.Success)
         {
-            if (validationResult.Success)
-            {
-                StartCoroutine(LoadTrackFromMongoDB(song, song.Status == "playing"));
-                Debug.Log($"[TRACKQUEUE] Real-time: Successfully added {song.Title} to Unity queue");
-            }
-            else
-            {
-                Debug.LogWarning($"[TRACKQUEUE] Real-time: Failed to validate {song.Title}");
-            }
+            StartCoroutine(LoadTrackFromMongoDB(song, song.Status == "playing"));
+            Debug.Log($"[TRACKQUEUE] Real-time: Successfully added {song.Title} to Unity queue");
         }
-        catch (Exception ex)
+        else
         {
-            Debug.LogError($"[TRACKQUEUE] Error validating song in real-time: {ex.Message}");
+            Debug.LogWarning($"[TRACKQUEUE] Real-time: Failed to validate {song.Title}");
         }
     }
 
@@ -650,11 +1097,49 @@ public class TrackQueueManager : MonoBehaviour
         }
     }
 
+    private IEnumerator DeleteTracklistEntryCoroutine(string tracklistId)
+    {
+        bool deleteComplete = false;
+        bool deleteSuccess = false;
+        string errorMessage = null;
+
+        // Start async delete
+        _ = DeleteTracklistEntryAsync(tracklistId, deleteComplete, deleteSuccess, errorMessage);
+
+        // Wait for delete to complete
+        yield return new WaitUntil(() => deleteComplete);
+
+        if (!deleteSuccess)
+        {
+            Debug.LogError($"[TRACKQUEUE] Failed to delete tracklist entry: {errorMessage}");
+        }
+        else
+        {
+            Debug.Log($"[TRACKQUEUE] Successfully deleted tracklist entry: {tracklistId}");
+        }
+    }
+
     private async Task UpdateExistsAtMasterAsync(string tracklistId, bool existsAtMaster, int length, bool complete, bool success, string error)
     {
         try
         {
             bool result = await mongoDBManager.UpdateExistsAtMasterAsync(tracklistId, existsAtMaster, length);
+            success = result;
+            complete = true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            success = false;
+            complete = true;
+        }
+    }
+
+    private async Task DeleteTracklistEntryAsync(string tracklistId, bool complete, bool success, string error)
+    {
+        try
+        {
+            bool result = await mongoDBManager.DeleteTracklistEntryAsync(tracklistId);
             success = result;
             complete = true;
         }
@@ -1092,9 +1577,12 @@ public class TrackQueueManager : MonoBehaviour
 
         Debug.Log($"[TRACKQUEUE] Found valid path for {track.Title}: {audioPath}");
 
-        // Add to Unity queue - use length if available, otherwise duration
+        // Set currentPlayingTrack so skip functionality works
+        currentPlayingTrack = track;
+
+        // Add to Unity queue WITHOUT adding to MongoDB (since this is already a tracklist entry)
         int songDuration = (track.Length.HasValue && track.Length > 0) ? track.Length.Value : track.Duration;
-        yield return StartCoroutine(AddSongToQueueWithPath(track.Title, audioPath, songDuration, false));
+        yield return StartCoroutine(AddSongToQueueWithPathOnly(track.Title, audioPath, songDuration, false));
 
         // If this was a playing song, mark it as playing in MongoDB
         if (shouldPlay && mongoDBMasterController != null)
@@ -1294,8 +1782,21 @@ public class TrackQueueManager : MonoBehaviour
             yield break;
         }
 
-        string songName = Path.GetFileNameWithoutExtension(fullPath);
-        Debug.Log($"[TRACKQUEUE] Creating song instance: {songName}");
+        string fullFileName = Path.GetFileNameWithoutExtension(fullPath);
+        
+        // Split by dash and take only the first part for the song name
+        string songName;
+        if (fullFileName.Contains(" - "))
+        {
+            var parts = fullFileName.Split(new string[] { " - " }, 2, StringSplitOptions.None);
+            songName = parts[1].Trim();
+        }
+        else
+        {
+            songName = fullFileName;
+        }
+        
+        Debug.Log($"[TRACKQUEUE] Creating song instance: {songName} (from: {fullFileName})");
 
         Song songInstance = Instantiate(SongPrefab, SongContainer);
         songInstance.Initialize(songName, "Unknown Artist", fullPath, songName); // Use songName as identifier
@@ -1455,7 +1956,7 @@ public class TrackQueueManager : MonoBehaviour
     
 
     // New method: Add song to Unity queue, wait for it to start playing, THEN add to MongoDB tracklist
-    private IEnumerator AddSongToQueueWithPathAndMongoDB(string songName, string audioPath, int audioLength, 
+    public IEnumerator AddSongToQueueWithPathAndMongoDB(string songName, string audioPath, int audioLength, 
         MongoDBModels.SongDocument mongoSong, string albumName, string artist, string requestedBy)
     {
         Debug.Log($"[TRACKQUEUE] AddSongToQueueWithPathAndMongoDB: Starting for {songName}");
@@ -1647,6 +2148,71 @@ public class TrackQueueManager : MonoBehaviour
 }
 
 // New method: Add song to Unity queue using the actual file path
+    // Version that doesn't add to MongoDB - used when processing existing tracklist entries
+    public IEnumerator AddSongToQueueWithPathOnly(string songName, string audioPath, float length = 0f, bool isFromSlave = false)
+    {
+        Debug.Log($"[TRACKQUEUE] AddSongToQueueWithPathOnly called - Song: {songName}, Path: {audioPath}, Length: {length}, FromSlave: {isFromSlave}");
+        albumManager.UpdateDebugText($"Adding song to queue (no MongoDB): {songName}");
+
+        if (string.IsNullOrEmpty(audioPath) || !File.Exists(audioPath))
+        {
+            Debug.LogError($"[TRACKQUEUE] Audio file does not exist: {audioPath}");
+            albumManager.UpdateDebugText($"Audio file does not exist: {audioPath}");
+            yield break;
+        }
+
+        if (SongPrefab == null || SongContainer == null)
+        {
+            Debug.LogError($"[TRACKQUEUE] SongPrefab or SongContainer is null! SongPrefab: {SongPrefab}, SongContainer: {SongContainer}");
+            albumManager.UpdateDebugText("SongPrefab or SongContainer is null!");
+            yield break;
+        }
+
+        Debug.Log($"[TRACKQUEUE] Creating song instance: {songName} with path: {audioPath}");
+
+        Song songInstance = Instantiate(SongPrefab, SongContainer);
+        songInstance.Initialize(songName, "Unknown Artist", audioPath, songName);
+        queueList.Add((songInstance, songInstance.gameObject));
+        
+        Debug.Log($"[TRACKQUEUE] Added song to queue list: {songName} (GameObject: {songInstance.gameObject.name})");
+        Debug.Log($"[TRACKQUEUE] Total songs in queue: {queueList.Count}");
+
+        if (isFromSlave)
+        {
+            songInstance.SongLength = length;
+            albumManager.UpdateDebugText($"Slave added song with length: {songInstance.SongLength}.");
+        }
+        else
+        {
+            albumManager.UpdateDebugText($"Master loading song to get length: {songInstance.SongName}");
+
+            yield return songInstance.StartCoroutine(songInstance.LoadAudioClipFromPath());
+
+            AudioClip clip = songInstance.GetAudioClip();
+            if (clip == null)
+            {
+                albumManager.UpdateDebugText("Error: AudioClip is NULL. Skipping song.");
+                Debug.Log($"[TRACKQUEUE] Removing song due to NULL AudioClip: {songInstance.SongName}");
+                queueList.Remove((songInstance, songInstance.gameObject));
+                Debug.Log($"[TRACKQUEUE] Queue count after removal: {queueList.Count}");
+                yield break;
+            }
+
+            songInstance.SongLength = clip.length;
+            masterNetworkHandler?.SendSongWithLengthToSlave(songName, songInstance.SongLength);
+        }
+
+        if (!isPlaying && !albumManager.isSlave)
+        {
+            Debug.Log($"[TRACKQUEUE] Starting playback from AddSongToQueueWithPathOnly - Queue count: {queueList.Count}");
+            PlayQueue();
+        }
+        else
+        {
+            Debug.Log($"[TRACKQUEUE] Not starting playback from AddSongToQueueWithPathOnly - Queue count: {queueList.Count}, isPlaying: {isPlaying}, isSlave: {albumManager.isSlave}");
+        }
+    }
+
 public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, float length = 0f, bool isFromSlave = false)
 {
     Debug.Log($"[TRACKQUEUE] AddSongToQueueWithPath called - Song: {songName}, Path: {audioPath}, Length: {length}, FromSlave: {isFromSlave}");
@@ -1735,24 +2301,25 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
             if (albumManager.isSlave) audioSource.volume = 0;
 
             albumManager.UpdateDebugText("Playing song...");
-            audioSource.Play();
-            audioSource.loop = false;
             PlayedSongName.text = nextSong.SongName;
 
             // Set up time display
             UpdateUI();
 
-            // Notify MongoDB that song is playing
+            // Notify MongoDB that song is playing and get the tracklist entry
+            // Must be done BEFORE starting playback so currentPlayingTrack is set for deletion
             if (mongoDBMasterController != null)
             {
                 // Find the corresponding tracklist entry and mark as playing
                 _ = NotifyMongoDBSongPlaying(nextSong.SongName);
+                
+                // Also set currentPlayingTrack so skip and completion work
+                _ = SetCurrentPlayingTrackFromMongoDB(nextSong.SongName);
             }
-
-        
 
             // Start playback
             Debug.Log($"[TRACKQUEUE] Starting audio playback: {nextSong.SongName}");
+            audioSource.loop = false;
             audioSource.Play();
 
             // Update time display during playback
@@ -1761,6 +2328,26 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
                 if (!isPaused)
                 {
                     UpdateUI();
+                    
+                    // Check if song is about to finish (within 0.1 seconds) and delete from MongoDB
+                    if (audioSource.time >= audioSource.clip.length - 0.1f && currentPlayingTrack != null)
+                    {
+                        string songTitle = currentPlayingTrack.Title;
+                        string tracklistId = currentPlayingTrack.Id;
+                        
+                        Debug.Log($"[TRACKQUEUE] Song about to finish, deleting from MongoDB: {songTitle}");
+                        
+                        // Call FireAndForget to properly handle async without blocking
+                        FireAndForget(DeleteSkippedSongFromMongoDB(tracklistId, songTitle));
+                        
+                        // Also notify WebSocket server for real-time broadcasting
+                        if (webSocketAPI != null)
+                        {
+                            webSocketAPI.SkipCurrentSong();
+                        }
+                        
+                        currentPlayingTrack = null; // Clear to prevent duplicate deletion
+                    }
                 }
                 yield return null;
             }
@@ -1776,6 +2363,13 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         }
 
         StopAllPlayback(); // Stop everything when queue is empty
+        
+        // Auto-add random song when queue becomes empty (only for master)
+        if (!albumManager.isSlave && CanAutoAdd())
+        {
+            Debug.Log("[TRACKQUEUE] Queue became empty - auto-adding random song");
+            AddRandomSongSimple();
+        }
     }
 
 
@@ -1977,10 +2571,14 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         {
             albumManager.UpdateDebugText("Skipping to next song...");
 
-            // Update MongoDB status
+            // Remove from MongoDB tracklist entirely instead of marking as skipped
             if (currentPlayingTrack != null)
             {
-                await mongoDBManager.UpdateTracklistStatusAsync(currentPlayingTrack.Id, "skipped");
+                string songTitle = currentPlayingTrack.Title;
+                string tracklistId = currentPlayingTrack.Id;
+                
+                // Call FireAndForget to properly handle async without blocking
+                FireAndForget(DeleteSkippedSongFromMongoDB(tracklistId, songTitle));
             }
             
             // Notify WebSocket server for real-time broadcasting
@@ -2004,6 +2602,13 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
             else
             {
                 StopAllPlayback(); // If no songs left, stop everything
+                
+                // Auto-add random song when skip results in empty queue (only for master)
+                if (!albumManager.isSlave && CanAutoAdd())
+                {
+                    Debug.Log("[TRACKQUEUE] Skip resulted in empty queue - auto-adding random song");
+                    AddRandomSongSimple();
+                }
             }
             masterNetworkHandler.PlayNextSong();
         }
@@ -2055,6 +2660,46 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         }
     }
 
+    private async Task DeleteSkippedSongFromMongoDB(string tracklistId, string songTitle)
+    {
+        try
+        {
+            bool deleted = await mongoDBManager.DeleteTracklistEntryAsync(tracklistId);
+            if (deleted)
+            {
+                Debug.Log($"[TRACKQUEUE] Successfully removed skipped song from MongoDB tracklist: {songTitle}");
+            }
+            else
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Failed to remove skipped song from MongoDB tracklist: {songTitle}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error deleting skipped song from MongoDB: {ex.Message}");
+        }
+    }
+
+    private async Task DeleteFinishedSongFromMongoDB(string tracklistId, string songTitle)
+    {
+        try
+        {
+            bool deleted = await mongoDBManager.DeleteTracklistEntryAsync(tracklistId);
+            if (deleted)
+            {
+                Debug.Log($"[TRACKQUEUE] Successfully removed finished song from MongoDB tracklist: {songTitle}");
+            }
+            else
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Failed to remove finished song from MongoDB tracklist: {songTitle}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error deleting finished song from MongoDB: {ex.Message}");
+        }
+    }
+
     private async Task NotifyMongoDBSongPlaying(string songName)
     {
         try
@@ -2077,6 +2722,32 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         }
     }
 
+    private async Task SetCurrentPlayingTrackFromMongoDB(string songName)
+    {
+        try
+        {
+            if (mongoDBManager == null) return;
+
+            // Get all queued/playing songs and find the matching one
+            var allTracks = await mongoDBManager.GetAllTracklistEntriesAsync();
+            var matchingTrack = allTracks.FirstOrDefault(s => s.Title == songName);
+            
+            if (matchingTrack != null)
+            {
+                currentPlayingTrack = matchingTrack;
+                Debug.Log($"[TRACKQUEUE] Set currentPlayingTrack: {matchingTrack.Title} (ID: {matchingTrack.Id})");
+            }
+            else
+            {
+                Debug.LogWarning($"[TRACKQUEUE] Could not find tracklist entry for: {songName}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error setting currentPlayingTrack: {ex.Message}");
+        }
+    }
+
     private async Task NotifyMongoDBSongFinished(string songName)
     {
         try
@@ -2089,13 +2760,35 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
             
             if (finishedSong != null)
             {
-                await mongoDBManager.MarkSongAsPlayedAsync(finishedSong.Id);
-                albumManager.UpdateDebugText($"Marked {songName} as played in MongoDB");
+                // Delete the finished song from tracklist instead of marking as played
+                bool deleted = await mongoDBManager.DeleteTracklistEntryAsync(finishedSong.Id);
+                if (deleted)
+                {
+                    albumManager.UpdateDebugText($"Removed finished song from tracklist: {songName}");
+                }
+                else
+                {
+                    albumManager.UpdateDebugText($"Failed to remove finished song from tracklist: {songName}");
+                }
             }
         }
         catch (Exception ex)
         {
             albumManager.UpdateDebugText($"Error notifying MongoDB of song finished: {ex.Message}");
+        }
+    }
+    
+    
+    private async Task<List<MongoDBModels.SongDocument>> GetAllSongsFromMongoDB()
+    {
+        try
+        {
+            return await mongoDBManager.GetAllSongsAsync();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TRACKQUEUE] Error getting all songs from MongoDB: {ex.Message}");
+            return new List<MongoDBModels.SongDocument>();
         }
     }
     

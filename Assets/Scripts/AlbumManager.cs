@@ -7,10 +7,10 @@ using SFB;
 using System.Collections;
 using UnityEngine.UIElements;
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
 using MongoDBModels;
-using System.Linq;
 
 [Serializable]
 public class AlbumData
@@ -141,7 +141,7 @@ public class AlbumManager : MonoBehaviour
                 {
                     // Create album UI object
                     Album albumInstance = Instantiate(AlbumPrefab, UnseenAlbums);
-                    albumInstance.Initialize(mongoAlbum.Title, "Various Artists", null, "", albumNumber);
+                    albumInstance.Initialize(mongoAlbum.Title, mongoAlbum.Artist ?? "Various Artists", null, "", albumNumber);
                     albums.Add(albumInstance);
 
                     // Add songs to the album
@@ -157,8 +157,8 @@ public class AlbumManager : MonoBehaviour
                             var parts = mongoSong.Title.Split(new string[] { " - " }, 2, StringSplitOptions.None);
                             if (parts.Length == 2)
                             {
-                                artist = parts[0];
-                                songTitle = parts[1];
+                                songTitle = parts[0];
+                                artist = parts[1];
                             }
                         }
 
@@ -313,7 +313,7 @@ public class AlbumManager : MonoBehaviour
                 {
                     // Create album UI object
                     Album albumInstance = Instantiate(AlbumPrefab, UnseenAlbums);
-                    albumInstance.Initialize(mongoAlbum.Title, "Various Artists", null, "", albumNumber);
+                    albumInstance.Initialize(mongoAlbum.Title, mongoAlbum.Artist ?? "Various Artists", null, "", albumNumber);
                     albums.Add(albumInstance);
 
                     // Add songs to the album
@@ -329,8 +329,8 @@ public class AlbumManager : MonoBehaviour
                             var parts = mongoSong.Title.Split(new string[] { " - " }, 2, StringSplitOptions.None);
                             if (parts.Length == 2)
                             {
-                                artist = parts[0];
-                                songTitle = parts[1];
+                                songTitle = parts[0];
+                                artist = parts[1];
                             }
                         }
 
@@ -538,101 +538,171 @@ public class AlbumManager : MonoBehaviour
             return "";
         }
     }
-    public void ScanForAlbums()
+    public async void ScanForAlbums()
     {
         if (!Directory.Exists(AlbumBasePath))
         {
             UpdateDebugText($"Album folder path not found: {AlbumBasePath}");
             return;
         }
-        UpdateDebugText(AlbumBasePath);
-
-        // Clear previous data
-        ClearAlbums();
-        albums.Clear();
-        activeAlbums.Clear();
-        albumDataList.Clear();
-
-        int albNum = 0;
-        foreach (var directory in Directory.GetDirectories(AlbumBasePath))
+        
+        UpdateDebugText("Scanning for new, deleted albums and songs...");
+        
+        try
         {
-            string folderName = Path.GetFileName(directory);
-            string[] nameParts = folderName.Split('-');
-            if (nameParts.Length < 2)
+            // Get current albums and songs from MongoDB
+            var existingAlbums = await mongoDBManager.GetAllAlbumsAsync();
+            var existingSongs = await mongoDBManager.GetAllSongsAsync();
+            
+            // Track albums and songs that exist in the file system
+            var fileSystemAlbums = new HashSet<(string Album, string Artist)>();
+            var fileSystemSongs = new HashSet<(string Title, string Album)>();
+            
+            // Scan the folder for new content and track what exists
+            var newAlbums = new List<MongoDBModels.AlbumDocument>();
+            var newSongs = new List<MongoDBModels.SongDocument>();
+            
+            int albNum = 0;
+            foreach (var directory in Directory.GetDirectories(AlbumBasePath))
             {
-                UpdateDebugText($"Skipping invalid album folder: {folderName}. Expected format: 'Artist Name - Album Name'");
-                continue;
-            }
-
-            string artistName = nameParts[0].Trim();
-            string albumName = nameParts[1].Trim();
-
-            // Check for album cover
-            string[] coverExtensions = { ".png", ".jpg" };
-            string coverPath = null;
-            foreach (var ext in coverExtensions)
-            {
-                string potentialPath = Path.Combine(directory, $"cover{ext}");
-                if (System.IO.File.Exists(potentialPath))
+                string folderName = Path.GetFileName(directory);
+                string[] nameParts = folderName.Split('-');
+                if (nameParts.Length < 2)
                 {
-                    coverPath = potentialPath;
-                    break;
-                }
-            }
-
-            if (coverPath == null)
-            {
-                UpdateDebugText($"No cover image found for album: {folderName}");
-                continue;
-            }
-
-            // Create album data
-            AlbumData albumData = new AlbumData
-            {
-                AlbumName = albumName,
-                ArtistName = artistName,
-                CoverPath = coverPath,
-                AlbumPath = directory,
-                Songs = new List<SongData>()
-            };
-
-            // Add songs using ID3 tag data
-            string[] audioFiles = Directory.GetFiles(directory, "*.mp3");
-            foreach (var audioFile in audioFiles)
-            {
-                string songTitle = GetSongTitle(audioFile);
-                if (string.IsNullOrEmpty(songTitle))
-                {
-                    songTitle = Path.GetFileNameWithoutExtension(audioFile); // Fallback to filename
+                    UpdateDebugText($"Skipping invalid album folder: {folderName}. Expected format: 'Artist Name - Album Name'");
+                    continue;
                 }
 
-                albumData.Songs.Add(new SongData { SongName = songTitle });
+                string artistName = nameParts[0].Trim();
+                string albumName = nameParts[1].Trim();
+                
+                // Track this album as existing in file system
+                fileSystemAlbums.Add((albumName, artistName));
+                
+                // Check if album already exists in MongoDB
+                var existingAlbum = existingAlbums.FirstOrDefault(a => a.Title == albumName && a.Artist == artistName);
+                if (existingAlbum == null)
+                {
+                    // New album found - add to MongoDB
+                    var newAlbum = new MongoDBModels.AlbumDocument
+                    {
+                        Title = albumName,
+                        Artist = artistName
+                    };
+                    newAlbums.Add(newAlbum);
+                    Debug.Log($"[ALBUM_MANAGER] New album found: {albumName} by {artistName}");
+                }
+
+                // Check for album cover
+                string[] coverExtensions = { ".png", ".jpg" };
+                string coverPath = null;
+                foreach (var ext in coverExtensions)
+                {
+                    string potentialPath = Path.Combine(directory, $"cover{ext}");
+                    if (System.IO.File.Exists(potentialPath))
+                    {
+                        coverPath = potentialPath;
+                        break;
+                    }
+                }
+
+                if (coverPath == null)
+                {
+                    UpdateDebugText($"No cover image found for album: {folderName}");
+                    continue;
+                }
+
+                // Scan songs in this album
+                string[] audioFiles = Directory.GetFiles(directory, "*.mp3");
+                foreach (var audioFile in audioFiles)
+                {
+                    string songTitle = GetSongTitle(audioFile);
+                    if (string.IsNullOrEmpty(songTitle))
+                    {
+                        songTitle = Path.GetFileNameWithoutExtension(audioFile); // Fallback to filename
+                    }
+                    
+                    // Track this song as existing in file system
+                    fileSystemSongs.Add((songTitle, albumName));
+                    
+                    // Check if song already exists in MongoDB
+                    var existingSong = existingSongs.FirstOrDefault(s => s.Title == songTitle && s.Album == albumName);
+                    if (existingSong == null)
+                    {
+                        // New song found - add to MongoDB
+                        var newSong = new MongoDBModels.SongDocument
+                        {
+                            Title = songTitle,
+                            Artist = artistName,
+                            Album = albumName,
+                            FamilyFriendly = false // Default to false, can be changed later
+                        };
+                        newSongs.Add(newSong);
+                        Debug.Log($"[ALBUM_MANAGER] New song found: {songTitle} in album {albumName}");
+                    }
+                }
             }
-
-            Debug.Log(albumData.AlbumName);
-            albumDataList.Add(albumData);
-
-            albNum++;
-            Sprite coverSprite = LoadSpriteFromPath(coverPath);
-            Album albumInstance = Instantiate(AlbumPrefab, UnseenAlbums);
-            albumInstance.Initialize(albumName, artistName, coverSprite, directory, albNum);
-            albums.Add(albumInstance);
+            
+            // Add new albums to MongoDB
+            foreach (var album in newAlbums)
+            {
+                await mongoDBManager.AddAlbumAsync(album.Title, album.Artist);
+                Debug.Log($"[ALBUM_MANAGER] Added new album to MongoDB: {album.Title}");
+            }
+            
+            // Add new songs to MongoDB
+            foreach (var song in newSongs)
+            {
+                await mongoDBManager.AddSongAsync(song.Title, song.Artist, song.Album, song.FamilyFriendly);
+                Debug.Log($"[ALBUM_MANAGER] Added new song to MongoDB: {song.Title}");
+            }
+            
+            // Detect and delete albums that no longer exist in file system
+            int deletedAlbumsCount = 0;
+            foreach (var album in existingAlbums)
+            {
+                if (!fileSystemAlbums.Contains((album.Title, album.Artist)))
+                {
+                    Debug.Log($"[ALBUM_MANAGER] Album deleted from file system: {album.Title} by {album.Artist}");
+                    // Delete all songs from this album first
+                    await mongoDBManager.DeleteSongsByAlbumAsync(album.Title);
+                    // Then delete the album
+                    await mongoDBManager.DeleteAlbumAsync(album.Title, album.Artist);
+                    deletedAlbumsCount++;
+                }
+            }
+            
+            // Detect and delete songs that no longer exist in file system
+            int deletedSongsCount = 0;
+            foreach (var song in existingSongs)
+            {
+                if (!fileSystemSongs.Contains((song.Title, song.Album)))
+                {
+                    Debug.Log($"[ALBUM_MANAGER] Song deleted from file system: {song.Title} in album {song.Album}");
+                    await mongoDBManager.DeleteSongAsync(song.Title, song.Album);
+                    deletedSongsCount++;
+                }
+            }
+            
+            // Reload UI with updated data if any changes were made
+            bool hasChanges = newAlbums.Count > 0 || newSongs.Count > 0 || deletedAlbumsCount > 0 || deletedSongsCount > 0;
+            if (hasChanges)
+            {
+                string changesSummary = $"Added: {newAlbums.Count} albums, {newSongs.Count} songs. Deleted: {deletedAlbumsCount} albums, {deletedSongsCount} songs.";
+                UpdateDebugText(changesSummary + " Reloading UI...");
+                Debug.Log($"[ALBUM_MANAGER] {changesSummary}");
+                await LoadAlbumsFromMongoDB();
+            }
+            else
+            {
+                UpdateDebugText("No changes detected. Albums and songs are up to date.");
+            }
         }
-      
-
-
-        /*    AlbumDataListWrapper wrapper = new AlbumDataListWrapper(albumDataList);
-
-            string albumJson = JsonUtility.ToJson(wrapper, true); // "true" makes it pretty-printed
-
-            string filePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "albumData.json");
-            File.WriteAllText(filePath, albumJson);
-
-            Debug.Log("Albums serialized to: " + filePath);
-            Debug.Log("Serialized JSON: " + albumJson);*/
-
-
-        InitializeAlbums();
+        catch (Exception ex)
+        {
+            Debug.LogError($"[ALBUM_MANAGER] Error scanning for albums: {ex.Message}");
+            UpdateDebugText($"Error scanning albums: {ex.Message}");
+        }
     }
     public void UpdateAlbumData(string albumJson)
     {

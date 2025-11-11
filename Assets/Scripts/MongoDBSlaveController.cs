@@ -250,14 +250,28 @@ public class MongoDBSlaveController : MonoBehaviour
     {
         try
         {
-            // Update current playing song status in MongoDB
+            // Get current playing songs for this slave
             var playingSongs = await mongoDBManager.GetPlayingSongsAsync();
-            foreach (var song in playingSongs)
+            
+            // Check if we have a playing song for this slave
+            var currentSong = playingSongs.FirstOrDefault(s => s.SlaveId == slaveId);
+            
+            if (currentSong != null)
             {
-                if (song.SlaveId == slaveId)
+                // If we have a playing song, pause it
+                await mongoDBManager.UpdateTracklistStatusAsync(currentSong.Id, "paused", slaveId);
+                Debug.Log($"[MONGODB_SLAVE] Paused song: {currentSong.Title}");
+            }
+            else
+            {
+                // If no playing song, check for paused songs and resume the first one
+                var allSongs = await mongoDBManager.GetAllTracklistEntriesAsync();
+                var pausedSong = allSongs.FirstOrDefault(s => s.SlaveId == slaveId && s.Status == "paused");
+                
+                if (pausedSong != null)
                 {
-                    // Toggle pause/resume - you might want to add a specific status for this
-                    await mongoDBManager.UpdateTracklistStatusAsync(song.Id, TracklistStatus.Queued, slaveId);
+                    await mongoDBManager.UpdateTracklistStatusAsync(pausedSong.Id, "playing", slaveId);
+                    Debug.Log($"[MONGODB_SLAVE] Resumed song: {pausedSong.Title}");
                 }
             }
 
@@ -275,13 +289,21 @@ public class MongoDBSlaveController : MonoBehaviour
     {
         try
         {
-            // Mark current song as skipped in MongoDB
+            // Remove current song from MongoDB tracklist entirely instead of marking as skipped
             var playingSongs = await mongoDBManager.GetPlayingSongsAsync();
             foreach (var song in playingSongs)
             {
                 if (song.SlaveId == slaveId)
                 {
-                    await mongoDBManager.UpdateTracklistStatusAsync(song.Id, TracklistStatus.Skipped, slaveId);
+                    bool deleted = await mongoDBManager.DeleteTracklistEntryAsync(song.Id);
+                    if (deleted)
+                    {
+                        Debug.Log($"Successfully removed skipped song from tracklist: {song.Title}");
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"Failed to remove skipped song from tracklist: {song.Title}");
+                    }
                 }
             }
 
@@ -326,12 +348,20 @@ public class MongoDBSlaveController : MonoBehaviour
     {
         try
         {
-            await mongoDBManager.MarkSongAsPlayedAsync(tracklistId);
-            UpdateDebugText("Song marked as played in MongoDB");
+            // Delete the finished song from tracklist instead of marking as played
+            bool deleted = await mongoDBManager.DeleteTracklistEntryAsync(tracklistId);
+            if (deleted)
+            {
+                UpdateDebugText("Finished song removed from tracklist");
+            }
+            else
+            {
+                UpdateDebugText("Failed to remove finished song from tracklist");
+            }
         }
         catch (Exception ex)
         {
-            UpdateDebugText($"Error marking song as played: {ex.Message}");
+            UpdateDebugText($"Error removing finished song: {ex.Message}");
         }
     }
 

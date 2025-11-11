@@ -13,6 +13,9 @@ namespace MongoDBModels
 
         [BsonElement("title")]
         public string Title { get; set; }
+
+        [BsonElement("artist")]
+        public string Artist { get; set; }
     }
 
     [Serializable]
@@ -24,6 +27,9 @@ namespace MongoDBModels
 
         [BsonElement("title")]
         public string Title { get; set; }
+
+        [BsonElement("artist")]
+        public string Artist { get; set; }
 
         [BsonElement("album")]
         public string Album { get; set; }

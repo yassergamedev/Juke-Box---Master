@@ -330,6 +330,7 @@ public class SlaveController : MonoBehaviour
             case "PAUSE_RESUME":
                 trackQueueManager.isSlavePlaying = !trackQueueManager.isSlavePlaying;
                 break;
+                
 
             case "NEXT_SONG":
                 trackQueueManager?.SkipSongSlave();

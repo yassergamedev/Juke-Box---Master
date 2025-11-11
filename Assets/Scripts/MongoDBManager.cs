@@ -74,6 +74,28 @@ public class MongoDBManager : MonoBehaviour
             return new List<AlbumDocument>();
         }
     }
+    
+    // Add new album to MongoDB
+    public async Task<bool> AddAlbumAsync(string title, string artist)
+    {
+        try
+        {
+            var album = new AlbumDocument
+            {
+                Title = title,
+                Artist = artist
+            };
+            
+            await albumsCollection.InsertOneAsync(album);
+            Debug.Log($"Added new album to MongoDB: {title} by {artist}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error adding album: {ex.Message}");
+            return false;
+        }
+    }
 
     // SongDocument operations
     public async Task<List<SongDocument>> GetAllSongsAsync()
@@ -88,7 +110,96 @@ public class MongoDBManager : MonoBehaviour
             return new List<SongDocument>();
         }
     }
+    
+    // Add new song to MongoDB
+    public async Task<bool> AddSongAsync(string title, string artist, string album, bool familyFriendly = false)
+    {
+        try
+        {
+            var song = new SongDocument
+            {
+                Title = title,
+                Artist = artist,
+                Album = album,
+                FamilyFriendly = familyFriendly
+            };
+            
+            await songsCollection.InsertOneAsync(song);
+            Debug.Log($"Added new song to MongoDB: {title} by {artist} in album {album}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error adding song: {ex.Message}");
+            return false;
+        }
+    }
 
+    // Delete album from MongoDB
+    public async Task<bool> DeleteAlbumAsync(string title, string artist)
+    {
+        try
+        {
+            var filter = Builders<AlbumDocument>.Filter.And(
+                Builders<AlbumDocument>.Filter.Eq(a => a.Title, title),
+                Builders<AlbumDocument>.Filter.Eq(a => a.Artist, artist)
+            );
+            var result = await albumsCollection.DeleteOneAsync(filter);
+            if (result.DeletedCount > 0)
+            {
+                Debug.Log($"Deleted album from MongoDB: {title} by {artist}");
+                return true;
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error deleting album: {ex.Message}");
+            return false;
+        }
+    }
+    
+    // Delete song from MongoDB
+    public async Task<bool> DeleteSongAsync(string title, string album)
+    {
+        try
+        {
+            var filter = Builders<SongDocument>.Filter.And(
+                Builders<SongDocument>.Filter.Eq(s => s.Title, title),
+                Builders<SongDocument>.Filter.Eq(s => s.Album, album)
+            );
+            var result = await songsCollection.DeleteOneAsync(filter);
+            if (result.DeletedCount > 0)
+            {
+                Debug.Log($"Deleted song from MongoDB: {title} in album {album}");
+                return true;
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error deleting song: {ex.Message}");
+            return false;
+        }
+    }
+    
+    // Delete all songs from an album (used when album is deleted)
+    public async Task<int> DeleteSongsByAlbumAsync(string albumTitle)
+    {
+        try
+        {
+            var filter = Builders<SongDocument>.Filter.Eq(s => s.Album, albumTitle);
+            var result = await songsCollection.DeleteManyAsync(filter);
+            Debug.Log($"Deleted {result.DeletedCount} songs from album: {albumTitle}");
+            return (int)result.DeletedCount;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error deleting songs by album: {ex.Message}");
+            return 0;
+        }
+    }
+    
     public async Task<List<SongDocument>> GetSongsByAlbumAsync(string albumTitle)
     {
         try
@@ -224,13 +335,22 @@ public class MongoDBManager : MonoBehaviour
             var playingSongs = await GetPlayingSongsAsync();
             foreach (var SongDocument in playingSongs)
             {
-                await UpdateTracklistStatusAsync(SongDocument.Id, TracklistStatus.Skipped);
+                // Delete the song from tracklist instead of marking as skipped
+                bool deleted = await DeleteTracklistEntryAsync(SongDocument.Id);
+                if (deleted)
+                {
+                    Debug.Log($"Successfully removed skipped song from tracklist: {SongDocument.Title}");
+                }
+                else
+                {
+                    Debug.LogWarning($"Failed to remove skipped song from tracklist: {SongDocument.Title}");
+                }
             }
             return true;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Error skipping current SongDocument: {ex.Message}");
+            Debug.LogError($"Error deleting current SongDocument: {ex.Message}");
             return false;
         }
     }
@@ -259,11 +379,21 @@ public class MongoDBManager : MonoBehaviour
     {
         try
         {
-            return await UpdateTracklistStatusAsync(tracklistId, TracklistStatus.Played);
+            // Delete the song from tracklist instead of marking as played
+            bool deleted = await DeleteTracklistEntryAsync(tracklistId);
+            if (deleted)
+            {
+                Debug.Log($"Successfully removed finished song from tracklist: {tracklistId}");
+            }
+            else
+            {
+                Debug.LogWarning($"Failed to remove finished song from tracklist: {tracklistId}");
+            }
+            return deleted;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Error marking SongDocument as played: {ex.Message}");
+            Debug.LogError($"Error deleting finished SongDocument: {ex.Message}");
             return false;
         }
     }
