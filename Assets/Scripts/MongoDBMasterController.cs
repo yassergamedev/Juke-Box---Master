@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using MongoDBModels;
 using System;
 using System.Linq;
+using System.IO;
 
 public class MongoDBMasterController : MonoBehaviour
 {
@@ -388,6 +389,37 @@ public class MongoDBMasterController : MonoBehaviour
     {
         try
         {
+            // Check if this is a friendly song (by album name or requestedBy)
+            bool isFriendlySong = song.Album == "Friendly Songs" || song.RequestedBy == "friendly-mode";
+            
+            if (isFriendlySong)
+            {
+                // Check friendly songs folder
+                string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+                if (!string.IsNullOrEmpty(friendlyFolderPath) && Directory.Exists(friendlyFolderPath))
+                {
+                    string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+                    var filesInFolder = Directory.GetFiles(friendlyFolderPath)
+                        .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                        .ToList();
+                    
+                    // Check if file exists by matching song title
+                    bool fileExists = filesInFolder.Any(f => 
+                        Path.GetFileNameWithoutExtension(f).Equals(song.Title, StringComparison.OrdinalIgnoreCase) ||
+                        Path.GetFileNameWithoutExtension(f).Contains(song.Title) ||
+                        song.Title.Contains(Path.GetFileNameWithoutExtension(f)));
+                    
+                    if (fileExists)
+                    {
+                        Debug.Log($"[MONGODB_MASTER] Friendly song verified: {song.Title}");
+                        return true;
+                    }
+                }
+                // If friendly folder doesn't exist, still return true to allow processing
+                // (the actual file check will happen in AddSongToQueueByName)
+                return true;
+            }
+            
             // Check if it's a keypad input (DD-DD format)
             if (song.Title.Contains("-") && song.Title.Length == 5)
             {

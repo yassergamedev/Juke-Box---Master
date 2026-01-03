@@ -38,26 +38,40 @@ public class WebSocketTracklistAPI : MonoBehaviour
     // Message queue for thread-safe processing
     private Queue<string> messageQueue = new Queue<string>();
     private object queueLock = new object();
+    private const int maxMessageQueueSize = 500; // Prevent memory leak
     
     private void Start()
     {
         ConnectToWebSocket();
     }
     
+    private float wsUpdateTimer = 0f;
+    private const float wsUpdateInterval = 0.05f; // Process every 50ms instead of every frame
+    
     private void Update()
     {
-        // Process queued messages on main thread
-        ProcessQueuedMessages();
+        // Throttle message processing to reduce blocking
+        wsUpdateTimer += Time.deltaTime;
+        if (wsUpdateTimer >= wsUpdateInterval)
+        {
+            wsUpdateTimer = 0f;
+            ProcessQueuedMessages();
+        }
     }
     
     private void ProcessQueuedMessages()
     {
+        // Limit processing per frame to prevent coroutine explosion
+        const int maxPerFrame = 2; // Reduced from 3 to prevent blocking
+        int processed = 0;
+        
         lock (queueLock)
         {
-            while (messageQueue.Count > 0)
+            while (messageQueue.Count > 0 && processed < maxPerFrame)
             {
                 string message = messageQueue.Dequeue();
                 StartCoroutine(ProcessWebSocketMessageOnMainThread(message));
+                processed++;
             }
         }
     }
@@ -89,12 +103,52 @@ public class WebSocketTracklistAPI : MonoBehaviour
         isConnected = true;
         reconnectAttempts = 0;
         Debug.Log("[WS_API] Connected to WebSocket server");
+        HubLogger.LogSuccess("WebSocket connected", LogCategory.WebSocket);
         OnConnectionStatusChanged?.Invoke("Connected");
         
         if (reconnectCoroutine != null)
         {
             StopCoroutine(reconnectCoroutine);
             reconnectCoroutine = null;
+        }
+        
+        // Register as master/hub or slave after connection
+        RegisterWithServer();
+    }
+    
+    /// <summary>
+    /// Registers this client with the WebSocket server as either master/hub or slave
+    /// </summary>
+    private void RegisterWithServer()
+    {
+        if (webSocket == null || !webSocket.IsAlive)
+        {
+            Debug.LogWarning("[WS_API] Cannot register - WebSocket not connected");
+            return;
+        }
+        
+        // Determine role based on AlbumManager
+        AlbumManager albumManager = FindObjectOfType<AlbumManager>();
+        string role = "master"; // Default to master
+        
+        if (albumManager != null && albumManager.isSlave)
+        {
+            role = "slave";
+        }
+        
+        // Create registration message as JSON string
+        string jsonMessage = $"{{\"type\":\"register\",\"role\":\"{role}\"}}";
+        
+        try
+        {
+            webSocket.Send(jsonMessage);
+            Debug.Log($"[WS_API] Registered with server as: {role}");
+            HubLogger.LogSuccess($"Registered with WebSocket server as: {role}", LogCategory.WebSocket);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[WS_API] Failed to register with server: {ex.Message}");
+            HubLogger.LogFailure($"Failed to register with WebSocket server: {ex.Message}", LogCategory.WebSocket);
         }
     }
     
@@ -121,6 +175,13 @@ public class WebSocketTracklistAPI : MonoBehaviour
             // Queue the message for processing on main thread
             lock (queueLock)
             {
+                // Prevent memory leak - limit queue size
+                if (messageQueue.Count >= maxMessageQueueSize)
+                {
+                    // Remove oldest message if queue is full
+                    messageQueue.Dequeue();
+                    Debug.LogWarning("[WS_API] Message queue full, dropping oldest message");
+                }
                 messageQueue.Enqueue(e.Data);
             }
         }
@@ -530,6 +591,7 @@ public class WebSocketTracklistAPI : MonoBehaviour
     private void OnWebSocketError(object sender, ErrorEventArgs e)
     {
         Debug.LogError($"[WS_API] WebSocket error: {e.Message}");
+        HubLogger.LogFailure($"WebSocket error: {e.Message}", LogCategory.WebSocket);
         isConnected = false;
         OnConnectionStatusChanged?.Invoke("Error");
         StartReconnectTimer();
@@ -538,6 +600,7 @@ public class WebSocketTracklistAPI : MonoBehaviour
     private void OnWebSocketClose(object sender, CloseEventArgs e)
     {
         Debug.Log($"[WS_API] WebSocket closed: {e.Reason}");
+        HubLogger.Log($"WebSocket closed: {e.Reason}", LogCategory.WebSocket);
         isConnected = false;
         OnConnectionStatusChanged?.Invoke("Disconnected");
         StartReconnectTimer();
@@ -926,15 +989,40 @@ public class WebSocketTracklistAPI : MonoBehaviour
 
     private void OnDestroy()
     {
+        // Unsubscribe from events
+        OnTracklistUpdate = null;
+        OnConnectionStatusChanged = null;
+        
+        // Close WebSocket connection
         if (webSocket != null)
         {
-            webSocket.Close();
+            try
+            {
+                webSocket.Close();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[WS_API] Error closing WebSocket: {ex.Message}");
+            }
+            webSocket = null;
         }
         
+        // Stop reconnect coroutine
         if (reconnectCoroutine != null)
         {
             StopCoroutine(reconnectCoroutine);
+            reconnectCoroutine = null;
         }
+        
+        // Clear message queue to prevent memory leak
+        lock (queueLock)
+        {
+            messageQueue.Clear();
+        }
+        
+        // Clear state
+        isConnected = false;
+        reconnectAttempts = 0;
     }
 }
 

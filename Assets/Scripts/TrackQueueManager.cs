@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using MongoDBModels;
 using MongoDB.Driver;
 using MongoDB.Bson;
+using SFB;
 
 public class TracklistLoadingResult
 {
@@ -62,6 +63,22 @@ public class TrackQueueManager : MonoBehaviour
     public Button playFriendlyButton; // Button to start playing friendly songs
     public Button backToNormalButton; // Button to exit friendly mode and return to normal albums
     
+    [Header("Folder 1 UI")]
+    public Button chooseFolder1Button; // Button to select folder 1
+    public Button playFolder1Button; // Button to start playing from folder 1
+    
+    [Header("Folder 2 UI")]
+    public Button chooseFolder2Button; // Button to select folder 2
+    public Button playFolder2Button; // Button to start playing from folder 2
+    
+    [Header("Folder 3 UI")]
+    public Button chooseFolder3Button; // Button to select folder 3
+    public Button playFolder3Button; // Button to start playing from folder 3
+    
+    [Header("Folder 4 UI")]
+    public Button chooseFolder4Button; // Button to select folder 4
+    public Button playFolder4Button; // Button to start playing from folder 4
+    
     [Header("Album Management UI")]
     public Button scanAlbumsButton; // Button to scan for new albums/songs and update MongoDB
 
@@ -105,6 +122,12 @@ public class TrackQueueManager : MonoBehaviour
     
     // Friendly songs mode tracking
     private bool isFriendlyMode = false;
+    
+    // Folder mode tracking (0 = normal, 1-4 = folder modes)
+    private int activeFolderMode = 0; // 0 = normal albums, 1-4 = folder 1-4
+    
+    // Prevent concurrent async operations
+    private bool isCheckingTracklist = false;
     private void Start()
     {
         Debug.Log("[TRACKQUEUE] Starting TrackQueueManager...");
@@ -128,12 +151,30 @@ public class TrackQueueManager : MonoBehaviour
         // Setup friendly songs button listeners
         SetupFriendlySongsButtons();
         
+        // Setup folder buttons listeners
+        SetupFolderButtons();
+        
         // Setup scan albums button listener
         SetupScanAlbumsButton();
 
         // Keep running and playing audio when app is unfocused or in background
         Application.runInBackground = true;
         AudioListener.pause = false;
+        
+        // Allow screen to sleep/blank according to system settings (for hub/master instances)
+        // This allows the screen to blank while audio continues playing in background
+        // Only apply to master/hub, not slaves (slaves may need to stay active for display)
+        if (albumManager != null && !albumManager.isSlave)
+        {
+            Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            Debug.Log("[TRACKQUEUE] Hub/Master instance - Screen sleep timeout set to SystemSetting - screen will blank according to system power settings");
+        }
+        else
+        {
+            // Slaves can prevent sleep if they need to maintain display
+            Screen.sleepTimeout = SleepTimeout.NeverSleep;
+            Debug.Log("[TRACKQUEUE] Slave instance - Screen sleep prevented to maintain display");
+        }
 
         // Show loading for startup processes
         ShowLoading(mongoDBLoadingPrefab, "Initializing tracklist...");
@@ -143,6 +184,12 @@ public class TrackQueueManager : MonoBehaviour
         
         // Load existing tracklist entries on startup (non-blocking)
         StartCoroutine(LoadExistingTracklistOnStartupAsync());
+        
+        // Load friendly mode state from previous session
+        LoadFriendlyModeState();
+        
+        // Load folder mode state from previous session
+        LoadFolderModeState();
         
         // Start real-time change stream monitoring (replaces polling)
         StartRealTimeMonitoring();
@@ -180,13 +227,18 @@ public class TrackQueueManager : MonoBehaviour
         // StartTracklistPolling();
     }
 
+    private float updateTimer = 0f;
+    private const float updateInterval = 0.1f; // Update UI every 100ms instead of every frame
+
     private void Update()
     {
-        // Debug log to track queue count changes
-        if (queueList.Count > 0)
+        // Throttle UI updates to reduce blocking
+        updateTimer += Time.deltaTime;
+        bool shouldUpdate = updateTimer >= updateInterval;
+        
+        if (shouldUpdate)
         {
-            // Queue monitoring - debug logs removed for cleaner console
-        }
+            updateTimer = 0f;
         
         if (audioSource.isPlaying && !albumManager.isSlave)
         {
@@ -202,7 +254,7 @@ public class TrackQueueManager : MonoBehaviour
                     UpdateSlaveUI();
                 }
             }
-          
+            }
         }
         
         // Auto-add random song if idle for 10 seconds on startup
@@ -265,9 +317,22 @@ public class TrackQueueManager : MonoBehaviour
         if (isFriendlyMode)
         {
             Debug.Log("[TRACKQUEUE] In friendly mode - adding friendly song");
+            HubLogger.Log("Auto-add: Friendly mode detected - adding friendly song", LogCategory.Queue);
             AddRandomFriendlySong();
             return;
         }
+        
+        // If in folder mode, use folder songs
+        if (activeFolderMode > 0)
+        {
+            Debug.Log($"[TRACKQUEUE] In folder {activeFolderMode} mode - adding folder song");
+            HubLogger.Log($"Auto-add: Folder {activeFolderMode} mode detected - adding folder song", LogCategory.Queue);
+            AddRandomFolderSong(activeFolderMode);
+            return;
+        }
+        
+        Debug.Log($"[TRACKQUEUE] Not in friendly mode (isFriendlyMode={isFriendlyMode}) or folder mode (activeFolderMode={activeFolderMode}) - adding from regular albums");
+        HubLogger.Log("Auto-add: Adding from regular albums", LogCategory.Queue);
         
         if (albumManager.albums.Count == 0)
         {
@@ -346,11 +411,11 @@ public class TrackQueueManager : MonoBehaviour
         }
     }
     
-    // New method for friendly songs using MongoDB system
+    // Method for friendly songs - follows exact same flow as Song.cs PlayAudio() -> AddSongToQueue()
     public async void AddRandomFriendlySong()
     {
-        Debug.Log("[TRACKQUEUE] Adding random friendly song...");
-        
+        try
+        {
         string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
         if (string.IsNullOrEmpty(friendlyFolderPath) || !Directory.Exists(friendlyFolderPath))
         {
@@ -359,81 +424,106 @@ public class TrackQueueManager : MonoBehaviour
             return;
         }
         
-        try
-        {
-            // Get all friendly songs from MongoDB
-            var allSongs = await mongoDBManager.GetAllSongsAsync();
-            var friendlySongs = allSongs.Where(s => s.FamilyFriendly == true).ToList();
+            // Get all audio files and pick random one (equivalent to picking random album/song)
+            string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+            var audioFiles = Directory.GetFiles(friendlyFolderPath)
+                .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
             
-            if (friendlySongs.Count == 0)
+            if (audioFiles.Count == 0)
             {
-                Debug.LogWarning("[TRACKQUEUE] No friendly songs found in MongoDB");
-                albumManager.UpdateDebugText("No friendly songs found in database!");
+                Debug.LogWarning("[TRACKQUEUE] No audio files found in friendly songs folder");
+                albumManager.UpdateDebugText("No audio files found in friendly songs folder!");
                 return;
             }
             
-            // Pick a random friendly song
+            // Pick a random file (equivalent to picking random album and song)
             var random = new System.Random();
-            var randomSong = friendlySongs[random.Next(friendlySongs.Count)];
+            string randomAudioPath = audioFiles[random.Next(audioFiles.Count)];
+            string songTitle = Path.GetFileNameWithoutExtension(randomAudioPath);
             
-            Debug.Log($"[TRACKQUEUE] Selected random friendly song: {randomSong.Title} from album: {randomSong.Album}");
-            
-            // Find the album folder
-            string albumPath = albumManager.FindAlbumFolder(randomSong.Album);
-            if (string.IsNullOrEmpty(albumPath))
+            // Clean up song title (remove common patterns like "01 - Song Name")
+            string songName = songTitle;
+            if (songTitle.Contains(" - "))
             {
-                Debug.LogWarning($"[TRACKQUEUE] Album folder not found for: {randomSong.Album}");
-                albumManager.UpdateDebugText($"Album folder not found for: {randomSong.Album}");
-                return;
+                var parts = songTitle.Split(new string[] { " - " }, 2, StringSplitOptions.None);
+                if (parts.Length > 1)
+                {
+                    songName = parts[1].Trim();
+                }
             }
             
-            // Find the audio file
-            string audioPath = albumManager.FindSongFilePath(albumPath, randomSong.Title);
-            if (string.IsNullOrEmpty(audioPath))
+            string friendlyAlbumName = "Friendly Songs";
+            
+            Debug.Log($"[TRACKQUEUE] STEP 1: Validating audio file exists for: {songName} (from file: {songTitle})");
+            
+            // Find the corresponding MongoDB song - EXACT same lookup as normal songs
+            var mongoSongs = await mongoDBManager.GetAllSongsAsync();
+            var mongoSong = mongoSongs.Find(s => s.Title.Contains(songName) && s.Album == friendlyAlbumName);
+            
+            // Also try matching by the original filename if exact match fails
+            if (mongoSong == null)
             {
-                Debug.LogWarning($"[TRACKQUEUE] Audio file not found for: {randomSong.Title}");
-                albumManager.UpdateDebugText($"Audio file not found for: {randomSong.Title}");
-                return;
+                mongoSong = mongoSongs.Find(s => (s.Title.Contains(songTitle) || songTitle.Contains(s.Title)) && s.Album == friendlyAlbumName);
             }
             
-            // Get the song length
-            int songDuration = albumManager.GetAudioFileLength(audioPath);
-            if (songDuration <= 0)
+            // If not found, create it (friendly songs might not be scanned yet)
+            if (mongoSong == null)
             {
-                Debug.LogWarning($"[TRACKQUEUE] Could not get audio length for: {randomSong.Title}");
-                songDuration = 180; // Default duration
+                Debug.Log($"[TRACKQUEUE] Song not found in MongoDB, creating it: {songName}");
+                bool added = await mongoDBManager.AddSongAsync(songName, "Unknown Artist", friendlyAlbumName, familyFriendly: true);
+                
+                if (added)
+                {
+                    // Get the newly created song
+                    mongoSongs = await mongoDBManager.GetAllSongsAsync();
+                    mongoSong = mongoSongs.Find(s => s.Title.Contains(songName) && s.Album == friendlyAlbumName);
+                }
+                
+                if (mongoSong == null)
+                {
+                    Debug.LogError($"[TRACKQUEUE] Failed to create song in MongoDB: {songName}");
+                    albumManager.UpdateDebugText($"Failed to add song to MongoDB: {songName}");
+                    return;
+                }
             }
             
-            Debug.Log($"[TRACKQUEUE] Adding friendly song to tracklist: {randomSong.Title}");
+            Debug.Log($"[TRACKQUEUE] Found MongoDB song: {mongoSong.Title} (ID: {mongoSong.Id})");
             
-            // Add to MongoDB tracklist (this will trigger real-time updates)
-            string masterId = albumManager.isSlave ? "slave" : "master";
-            var tracklistEntry = await mongoDBManager.AddSongToTracklistAsync(
-                randomSong.Id,
-                randomSong.Title,
-                randomSong.Artist ?? "Unknown Artist",
-                randomSong.Album,
-                songDuration,
-                "friendly-mode",
-                masterId,
-                1 // Default priority
-            );
+            // STEP 2: Find audio path and validate it exists
+            Debug.Log($"[TRACKQUEUE] STEP 2: Finding and validating audio file");
             
-            if (tracklistEntry != null)
+            string albumPath = friendlyFolderPath; // For friendly songs, the folder is the "album path"
+            string audioPath = randomAudioPath;
+            int audioLength = 180; // Default duration
+            
+            if (!string.IsNullOrEmpty(audioPath))
             {
-                Debug.Log($"[TRACKQUEUE] Successfully added friendly song to tracklist: {randomSong.Title}");
-                albumManager.UpdateDebugText($"Added friendly song: {randomSong.Title}");
+                audioLength = albumManager.GetAudioFileLength(audioPath);
+                if (audioLength <= 0)
+                {
+                    audioLength = 180; // Fallback to default
+                }
             }
             else
             {
-                Debug.LogError($"[TRACKQUEUE] Failed to add friendly song to tracklist: {randomSong.Title}");
-                albumManager.UpdateDebugText($"Failed to add friendly song: {randomSong.Title}");
+                Debug.LogError($"[TRACKQUEUE] Audio file not found for song: {songName}");
+                albumManager.UpdateDebugText($"Audio file not found for song: {songName}");
+                return;
             }
+            
+            // STEP 3: Add to Unity queue and start playing FIRST
+            Debug.Log($"[TRACKQUEUE] STEP 3: Adding to Unity queue and starting playback");
+            StartCoroutine(AddSongToQueueWithPathAndMongoDB(songName, audioPath, audioLength, mongoSong, friendlyAlbumName, mongoSong.Artist ?? "Unknown Artist", "friendly-mode"));
+            
+            Debug.Log($"[TRACKQUEUE] Song addition initiated for: {songName} - will add to MongoDB after loading completes");
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[TRACKQUEUE] Error adding friendly song: {ex.Message}");
+            string errorMsg = $"Error adding friendly song: {ex.Message}";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
             albumManager.UpdateDebugText($"Error adding friendly song: {ex.Message}");
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
         }
     }
     
@@ -443,28 +533,133 @@ public class TrackQueueManager : MonoBehaviour
         if (chooseAlbumButton != null)
         {
             chooseAlbumButton.onClick.AddListener(OnChooseAlbumButtonClicked);
+            Debug.Log("[TRACKQUEUE] ChooseAlbumButton listener set up");
+            HubLogger.Log("ChooseAlbumButton listener set up", LogCategory.System);
         }
         else
         {
             Debug.LogWarning("[TRACKQUEUE] ChooseAlbumButton not assigned!");
+            HubLogger.LogWarning("ChooseAlbumButton not assigned in Inspector", LogCategory.System);
         }
         
         if (playFriendlyButton != null)
         {
             playFriendlyButton.onClick.AddListener(OnPlayFriendlyButtonClicked);
+            Debug.Log("[TRACKQUEUE] PlayFriendlyButton listener set up");
+            HubLogger.Log("PlayFriendlyButton listener set up", LogCategory.System);
         }
         else
         {
             Debug.LogWarning("[TRACKQUEUE] PlayFriendlyButton not assigned!");
+            HubLogger.LogFailure("PlayFriendlyButton not assigned in Inspector - friendly mode will not work!", LogCategory.System);
         }
         
         if (backToNormalButton != null)
         {
             backToNormalButton.onClick.AddListener(OnBackToNormalButtonClicked);
+            Debug.Log("[TRACKQUEUE] BackToNormalButton listener set up");
+            HubLogger.Log("BackToNormalButton listener set up", LogCategory.System);
         }
         else
         {
             Debug.LogWarning("[TRACKQUEUE] BackToNormalButton not assigned!");
+            HubLogger.LogWarning("BackToNormalButton not assigned in Inspector", LogCategory.System);
+        }
+    }
+    
+    // Setup folder buttons listeners
+    private void SetupFolderButtons()
+    {
+        // Folder 1
+        if (chooseFolder1Button != null)
+        {
+            chooseFolder1Button.onClick.AddListener(OnChooseFolder1ButtonClicked);
+            Debug.Log("[TRACKQUEUE] ChooseFolder1Button listener set up");
+            HubLogger.Log("ChooseFolder1Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ChooseFolder1Button not assigned!");
+        }
+        
+        if (playFolder1Button != null)
+        {
+            playFolder1Button.onClick.AddListener(OnPlayFolder1ButtonClicked);
+            Debug.Log("[TRACKQUEUE] PlayFolder1Button listener set up");
+            HubLogger.Log("PlayFolder1Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] PlayFolder1Button not assigned!");
+        }
+        
+        // Folder 2
+        if (chooseFolder2Button != null)
+        {
+            chooseFolder2Button.onClick.AddListener(OnChooseFolder2ButtonClicked);
+            Debug.Log("[TRACKQUEUE] ChooseFolder2Button listener set up");
+            HubLogger.Log("ChooseFolder2Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ChooseFolder2Button not assigned!");
+        }
+        
+        if (playFolder2Button != null)
+        {
+            playFolder2Button.onClick.AddListener(OnPlayFolder2ButtonClicked);
+            Debug.Log("[TRACKQUEUE] PlayFolder2Button listener set up");
+            HubLogger.Log("PlayFolder2Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] PlayFolder2Button not assigned!");
+        }
+        
+        // Folder 3
+        if (chooseFolder3Button != null)
+        {
+            chooseFolder3Button.onClick.AddListener(OnChooseFolder3ButtonClicked);
+            Debug.Log("[TRACKQUEUE] ChooseFolder3Button listener set up");
+            HubLogger.Log("ChooseFolder3Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ChooseFolder3Button not assigned!");
+        }
+        
+        if (playFolder3Button != null)
+        {
+            playFolder3Button.onClick.AddListener(OnPlayFolder3ButtonClicked);
+            Debug.Log("[TRACKQUEUE] PlayFolder3Button listener set up");
+            HubLogger.Log("PlayFolder3Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] PlayFolder3Button not assigned!");
+        }
+        
+        // Folder 4
+        if (chooseFolder4Button != null)
+        {
+            chooseFolder4Button.onClick.AddListener(OnChooseFolder4ButtonClicked);
+            Debug.Log("[TRACKQUEUE] ChooseFolder4Button listener set up");
+            HubLogger.Log("ChooseFolder4Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] ChooseFolder4Button not assigned!");
+        }
+        
+        if (playFolder4Button != null)
+        {
+            playFolder4Button.onClick.AddListener(OnPlayFolder4ButtonClicked);
+            Debug.Log("[TRACKQUEUE] PlayFolder4Button listener set up");
+            HubLogger.Log("PlayFolder4Button listener set up", LogCategory.System);
+        }
+        else
+        {
+            Debug.LogWarning("[TRACKQUEUE] PlayFolder4Button not assigned!");
         }
     }
     
@@ -507,6 +702,8 @@ public class TrackQueueManager : MonoBehaviour
     private void OnPlayFriendlyButtonClicked()
     {
         Debug.Log("[TRACKQUEUE] Play Friendly button clicked");
+        HubLogger.Log("Play Friendly button clicked", LogCategory.Queue);
+        HubLogger.Log($"Current isFriendlyMode: {isFriendlyMode}", LogCategory.Queue);
         StartFriendlyMode();
     }
     
@@ -517,10 +714,68 @@ public class TrackQueueManager : MonoBehaviour
         ExitFriendlyMode();
     }
     
-    // Exit friendly mode and return to normal albums
+    // Handle folder button clicks - Folder 1
+    private void OnChooseFolder1ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Choose Folder 1 button clicked");
+        SelectFolder(1);
+    }
+    
+    private void OnPlayFolder1ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Play Folder 1 button clicked");
+        HubLogger.Log("Play Folder 1 button clicked", LogCategory.Queue);
+        StartFolderMode(1);
+    }
+    
+    // Handle folder button clicks - Folder 2
+    private void OnChooseFolder2ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Choose Folder 2 button clicked");
+        SelectFolder(2);
+    }
+    
+    private void OnPlayFolder2ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Play Folder 2 button clicked");
+        HubLogger.Log("Play Folder 2 button clicked", LogCategory.Queue);
+        StartFolderMode(2);
+    }
+    
+    // Handle folder button clicks - Folder 3
+    private void OnChooseFolder3ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Choose Folder 3 button clicked");
+        SelectFolder(3);
+    }
+    
+    private void OnPlayFolder3ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Play Folder 3 button clicked");
+        HubLogger.Log("Play Folder 3 button clicked", LogCategory.Queue);
+        StartFolderMode(3);
+    }
+    
+    // Handle folder button clicks - Folder 4
+    private void OnChooseFolder4ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Choose Folder 4 button clicked");
+        SelectFolder(4);
+    }
+    
+    private void OnPlayFolder4ButtonClicked()
+    {
+        Debug.Log("[TRACKQUEUE] Play Folder 4 button clicked");
+        HubLogger.Log("Play Folder 4 button clicked", LogCategory.Queue);
+        StartFolderMode(4);
+    }
+    
+    // Exit friendly mode or folder mode and return to normal albums
+    // This method works for both friendly mode and folder modes
     private async void ExitFriendlyMode()
     {
-        Debug.Log("[TRACKQUEUE] Exiting friendly mode...");
+        string currentMode = isFriendlyMode ? "friendly mode" : (activeFolderMode > 0 ? $"folder {activeFolderMode} mode" : "normal mode");
+        Debug.Log($"[TRACKQUEUE] Exiting {currentMode}...");
         
         try
         {
@@ -546,11 +801,17 @@ public class TrackQueueManager : MonoBehaviour
             // Clear MongoDB tracklist
             await mongoDBManager.ClearTracklistAsync();
             
-            // Disable friendly mode
+            // Disable friendly mode and folder mode
             isFriendlyMode = false;
+            activeFolderMode = 0;
             
-            Debug.Log("[TRACKQUEUE] Friendly mode disabled - returning to normal albums");
+            // Save friendly mode state and folder mode state
+            SaveFriendlyModeState();
+            SaveFolderModeState();
+            
+            Debug.Log("[TRACKQUEUE] Special mode disabled - returning to normal albums");
             albumManager.UpdateDebugText("Returned to normal album mode");
+            HubLogger.Log("Special mode disabled - returning to normal albums", LogCategory.Queue);
             
             // Add first random song from normal albums
             AddRandomSongSimple();
@@ -566,15 +827,20 @@ public class TrackQueueManager : MonoBehaviour
     private async void StartFriendlyMode()
     {
         Debug.Log("[TRACKQUEUE] Starting friendly mode...");
+        HubLogger.Log("Starting friendly mode", LogCategory.Queue);
         
         // Check if friendly folder is selected
         string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
         if (string.IsNullOrEmpty(friendlyFolderPath) || !Directory.Exists(friendlyFolderPath))
         {
-            Debug.LogError("[TRACKQUEUE] FriendlyAlbumsPath is not set or folder doesn't exist");
+            string errorMsg = "FriendlyAlbumsPath is not set or folder doesn't exist";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
             albumManager.UpdateDebugText("Please select a friendly songs folder first!");
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
             return;
         }
+        
+        HubLogger.Log($"Friendly folder path: {friendlyFolderPath}", LogCategory.Files);
         
         try
         {
@@ -614,20 +880,460 @@ public class TrackQueueManager : MonoBehaviour
             // Clear MongoDB tracklist
             await mongoDBManager.ClearTracklistAsync();
             
-            // Enable friendly mode
+            // Enable friendly mode and disable folder mode
             isFriendlyMode = true;
+            activeFolderMode = 0;
             
-            Debug.Log("[TRACKQUEUE] Friendly mode enabled - adding first friendly song");
+            // Save friendly mode state and folder mode state
+            SaveFriendlyModeState();
+            SaveFolderModeState();
+            
+            Debug.Log($"[TRACKQUEUE] Friendly mode enabled (isFriendlyMode={isFriendlyMode}) - adding first friendly song");
             albumManager.UpdateDebugText("Friendly mode started - adding songs...");
+            HubLogger.LogSuccess($"Friendly mode enabled (isFriendlyMode={isFriendlyMode})", LogCategory.Queue);
             
             // Add first friendly song
+            HubLogger.Log("Adding first friendly song to queue", LogCategory.Queue);
             AddRandomFriendlySong();
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[TRACKQUEUE] Error starting friendly mode: {ex.Message}");
-            albumManager.UpdateDebugText($"Error starting friendly mode: {ex.Message}");
+            string errorMsg = $"Error starting friendly mode: {ex.Message}";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
+            albumManager.UpdateDebugText(errorMsg);
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
         }
+    }
+
+    /// <summary>
+    /// Saves the current friendly mode state to PlayerPrefs
+    /// </summary>
+    private void SaveFriendlyModeState()
+    {
+        PlayerPrefs.SetInt("IsFriendlyMode", isFriendlyMode ? 1 : 0);
+        PlayerPrefs.Save();
+        Debug.Log($"[TRACKQUEUE] Saved friendly mode state: {isFriendlyMode}");
+        HubLogger.Log($"Saved friendly mode state: {isFriendlyMode}", LogCategory.System);
+    }
+    
+    // Select folder for a specific folder number (1-4)
+    private async void SelectFolder(int folderNumber)
+    {
+        Debug.Log($"[TRACKQUEUE] Select Folder {folderNumber} button clicked");
+        
+        var paths = StandaloneFileBrowser.OpenFolderPanel($"Select Folder {folderNumber}", "", false);
+        
+        if (paths.Length > 0 && !string.IsNullOrEmpty(paths[0]))
+        {
+            string folderPath = paths[0];
+            string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+            
+            var allFiles = Directory.GetFiles(folderPath);
+            var nonSongFiles = allFiles.Where(file => !supportedExtensions.Contains(Path.GetExtension(file).ToLower())).ToList();
+            
+            if (nonSongFiles.Count > 0)
+            {
+                albumManager.UpdateDebugText($"The selected folder contains non-song files. Please select a folder with only .mp3, .wav, or .ogg files.");
+                return;
+            }
+            
+            string playerPrefsKey = $"Folder{folderNumber}Path";
+            PlayerPrefs.SetString(playerPrefsKey, folderPath);
+            PlayerPrefs.Save();
+            Debug.Log($"[TRACKQUEUE] Selected folder {folderNumber}: {folderPath}");
+            albumManager.UpdateDebugText($"Folder {folderNumber} successfully selected. Scanning songs...");
+            HubLogger.LogSuccess($"Folder {folderNumber} selected: {folderPath}", LogCategory.Files);
+            
+            // Scan and add songs to MongoDB (similar to friendly songs)
+            await ScanFolderSongs(folderPath, folderNumber);
+        }
+        else
+        {
+            albumManager.UpdateDebugText($"No folder selected for Folder {folderNumber}.");
+        }
+    }
+    
+    // Scan folder songs and add to MongoDB (similar to ScanFriendlySongs)
+    private async Task ScanFolderSongs(string folderPath, int folderNumber)
+    {
+        try
+        {
+            albumManager.UpdateDebugText($"Scanning folder {folderNumber}...");
+            HubLogger.Log($"Scanning folder {folderNumber}: {folderPath}", LogCategory.Files);
+            
+            string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+            var audioFiles = Directory.GetFiles(folderPath)
+                .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
+            
+            if (audioFiles.Count == 0)
+            {
+                albumManager.UpdateDebugText($"No audio files found in folder {folderNumber}.");
+                HubLogger.LogWarning($"No audio files found in folder {folderNumber}", LogCategory.Files);
+                return;
+            }
+            
+            string albumName = $"Folder {folderNumber}";
+            string artist = "Various Artists";
+            var existingSongs = await mongoDBManager.GetAllSongsAsync();
+            int addedCount = 0;
+            int updatedCount = 0;
+            
+            foreach (var audioFile in audioFiles)
+            {
+                string songTitle = Path.GetFileNameWithoutExtension(audioFile);
+                // Clean up song title (remove common patterns like "01 - Song Name")
+                if (songTitle.Contains(" - "))
+                {
+                    var parts = songTitle.Split(new string[] { " - " }, 2, StringSplitOptions.None);
+                    if (parts.Length > 1)
+                    {
+                        songTitle = parts[1].Trim();
+                    }
+                }
+                
+                // Check if song already exists
+                var existingSong = existingSongs.FirstOrDefault(s => 
+                    s.Title == songTitle && s.Album == albumName);
+                
+                if (existingSong == null)
+                {
+                    // New song - add it
+                    bool added = await mongoDBManager.AddSongAsync(
+                        songTitle, 
+                        artist, 
+                        albumName, 
+                        familyFriendly: false
+                    );
+                    if (added)
+                    {
+                        addedCount++;
+                        HubLogger.LogSuccess($"Added song to folder {folderNumber}: {songTitle}", LogCategory.Files);
+                    }
+                }
+            }
+            
+            albumManager.UpdateDebugText($"Folder {folderNumber} scan complete. Added: {addedCount}, Updated: {updatedCount}");
+            HubLogger.LogSuccess($"Folder {folderNumber} scan complete - Added: {addedCount}, Updated: {updatedCount}", LogCategory.Files);
+        }
+        catch (Exception ex)
+        {
+            string errorMsg = $"Error scanning folder {folderNumber}: {ex.Message}";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
+            albumManager.UpdateDebugText(errorMsg);
+            HubLogger.LogFailure(errorMsg, LogCategory.Files);
+        }
+    }
+    
+    // Start folder mode - clear queue and start playing from specific folder
+    private async void StartFolderMode(int folderNumber)
+    {
+        Debug.Log($"[TRACKQUEUE] Starting folder {folderNumber} mode...");
+        HubLogger.Log($"Starting folder {folderNumber} mode", LogCategory.Queue);
+        
+        // Check if folder is selected
+        string folderPath = PlayerPrefs.GetString($"Folder{folderNumber}Path", "");
+        if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+        {
+            string errorMsg = $"Folder{folderNumber}Path is not set or folder doesn't exist";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
+            albumManager.UpdateDebugText($"Please select folder {folderNumber} first!");
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
+            return;
+        }
+        
+        HubLogger.Log($"Folder {folderNumber} path: {folderPath}", LogCategory.Files);
+        
+        try
+        {
+            // Stop ALL playback and coroutines
+            StopAllPlayback();
+            
+            // Stop any running playback coroutines
+            if (playbackCoroutine != null)
+            {
+                StopCoroutine(playbackCoroutine);
+                playbackCoroutine = null;
+            }
+            
+            // Stop audio source
+            if (audioSource != null)
+            {
+                audioSource.Stop();
+                audioSource.clip = null;
+            }
+            
+            // Clear current queue (this should destroy UI elements)
+            ClearSongQueue();
+            
+            // Additional UI clearing - destroy any remaining song GameObjects
+            if (SongContainer != null)
+            {
+                foreach (Transform child in SongContainer)
+                {
+                    if (child != null)
+                    {
+                        Debug.Log($"[TRACKQUEUE] Destroying remaining UI element: {child.name}");
+                        Destroy(child.gameObject);
+                    }
+                }
+            }
+            
+            // Clear MongoDB tracklist
+            await mongoDBManager.ClearTracklistAsync();
+            
+            // Disable friendly mode and set active folder mode
+            isFriendlyMode = false;
+            activeFolderMode = folderNumber;
+            
+            // Save friendly mode state (to disable it)
+            SaveFriendlyModeState();
+            
+            // Save folder mode state
+            SaveFolderModeState();
+            
+            Debug.Log($"[TRACKQUEUE] Folder {folderNumber} mode enabled - adding first song");
+            albumManager.UpdateDebugText($"Folder {folderNumber} mode started - adding songs...");
+            HubLogger.LogSuccess($"Folder {folderNumber} mode enabled", LogCategory.Queue);
+            
+            // Add first song from folder
+            HubLogger.Log($"Adding first song from folder {folderNumber} to queue", LogCategory.Queue);
+            AddRandomFolderSong(folderNumber);
+        }
+        catch (Exception ex)
+        {
+            string errorMsg = $"Error starting folder {folderNumber} mode: {ex.Message}";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
+            albumManager.UpdateDebugText(errorMsg);
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
+        }
+    }
+    
+    // Save folder mode state
+    private void SaveFolderModeState()
+    {
+        PlayerPrefs.SetInt("ActiveFolderMode", activeFolderMode);
+        PlayerPrefs.Save();
+        Debug.Log($"[TRACKQUEUE] Saved folder mode state: {activeFolderMode}");
+        HubLogger.Log($"Saved folder mode state: {activeFolderMode}", LogCategory.System);
+    }
+    
+    // Add random song from specific folder (similar to AddRandomFriendlySong)
+    public async void AddRandomFolderSong(int folderNumber)
+    {
+        try
+        {
+            string folderPath = PlayerPrefs.GetString($"Folder{folderNumber}Path", "");
+            if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+            {
+                Debug.LogError($"[TRACKQUEUE] Folder{folderNumber}Path is not set or folder doesn't exist");
+                albumManager.UpdateDebugText($"Please select folder {folderNumber} first!");
+                return;
+            }
+            
+            // Get all audio files and pick random one
+            string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+            var audioFiles = Directory.GetFiles(folderPath)
+                .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
+            
+            if (audioFiles.Count == 0)
+            {
+                Debug.LogWarning($"[TRACKQUEUE] No audio files found in folder {folderNumber}");
+                albumManager.UpdateDebugText($"No audio files found in folder {folderNumber}!");
+                return;
+            }
+            
+            // Pick a random file
+            var random = new System.Random();
+            string randomAudioPath = audioFiles[random.Next(audioFiles.Count)];
+            string songTitle = Path.GetFileNameWithoutExtension(randomAudioPath);
+            
+            // Clean up song title (remove common patterns like "01 - Song Name")
+            string songName = songTitle;
+            if (songTitle.Contains(" - "))
+            {
+                var parts = songTitle.Split(new string[] { " - " }, 2, StringSplitOptions.None);
+                if (parts.Length > 1)
+                {
+                    songName = parts[1].Trim();
+                }
+            }
+            
+            string albumName = $"Folder {folderNumber}";
+            
+            Debug.Log($"[TRACKQUEUE] STEP 1: Validating audio file exists for: {songName} (from folder {folderNumber})");
+            
+            // Find the corresponding MongoDB song - EXACT same lookup as normal songs
+            var mongoSongs = await mongoDBManager.GetAllSongsAsync();
+            var mongoSong = mongoSongs.Find(s => s.Title.Contains(songName) && s.Album == albumName);
+            
+            // Also try matching by the original filename if exact match fails
+            if (mongoSong == null)
+            {
+                mongoSong = mongoSongs.Find(s => (s.Title.Contains(songTitle) || songTitle.Contains(s.Title)) && s.Album == albumName);
+            }
+            
+            // If not found, create it (songs might not be scanned yet)
+            if (mongoSong == null)
+            {
+                Debug.Log($"[TRACKQUEUE] Song not found in MongoDB, creating it: {songName}");
+                bool added = await mongoDBManager.AddSongAsync(songName, "Various Artists", albumName, familyFriendly: false);
+                
+                if (added)
+                {
+                    // Get the newly created song
+                    mongoSongs = await mongoDBManager.GetAllSongsAsync();
+                    mongoSong = mongoSongs.Find(s => s.Title.Contains(songName) && s.Album == albumName);
+                }
+                
+                if (mongoSong == null)
+                {
+                    Debug.LogError($"[TRACKQUEUE] Failed to create song in MongoDB: {songName}");
+                    albumManager.UpdateDebugText($"Failed to add song to MongoDB: {songName}");
+                    return;
+                }
+            }
+            
+            Debug.Log($"[TRACKQUEUE] Found MongoDB song: {mongoSong.Title} (ID: {mongoSong.Id})");
+            
+            // STEP 2: Find audio path and validate it exists
+            Debug.Log($"[TRACKQUEUE] STEP 2: Finding and validating audio file");
+            
+            string audioPath = randomAudioPath;
+            int audioLength = 180; // Default duration
+            
+            if (!string.IsNullOrEmpty(audioPath))
+            {
+                audioLength = albumManager.GetAudioFileLength(audioPath);
+                if (audioLength <= 0)
+                {
+                    audioLength = 180; // Fallback to default
+                }
+            }
+            else
+            {
+                Debug.LogError($"[TRACKQUEUE] Audio file not found for song: {songName}");
+                albumManager.UpdateDebugText($"Audio file not found for song: {songName}");
+                return;
+            }
+            
+            // STEP 3: Add to Unity queue and start playing FIRST
+            Debug.Log($"[TRACKQUEUE] STEP 3: Adding to Unity queue and starting playback");
+            StartCoroutine(AddSongToQueueWithPathAndMongoDB(songName, audioPath, audioLength, mongoSong, albumName, mongoSong.Artist ?? "Various Artists", $"folder-{folderNumber}"));
+            
+            Debug.Log($"[TRACKQUEUE] Song addition initiated for: {songName} - will add to MongoDB after loading completes");
+        }
+        catch (Exception ex)
+        {
+            string errorMsg = $"Error adding folder {folderNumber} song: {ex.Message}";
+            Debug.LogError($"[TRACKQUEUE] {errorMsg}");
+            albumManager.UpdateDebugText($"Error adding folder {folderNumber} song: {ex.Message}");
+            HubLogger.LogFailure(errorMsg, LogCategory.Queue);
+        }
+    }
+    
+    /// <summary>
+    /// Loads the friendly mode state from PlayerPrefs and restores it if it was enabled
+    /// </summary>
+    private void LoadFriendlyModeState()
+    {
+        int savedFriendlyMode = PlayerPrefs.GetInt("IsFriendlyMode", 0);
+        bool wasFriendlyMode = savedFriendlyMode == 1;
+        
+        Debug.Log($"[TRACKQUEUE] Loaded friendly mode state from previous session: {wasFriendlyMode}");
+        HubLogger.Log($"Loaded friendly mode state: {wasFriendlyMode}", LogCategory.System);
+        
+        if (wasFriendlyMode)
+        {
+            // Wait a moment for everything to initialize, then start friendly mode
+            StartCoroutine(RestoreFriendlyModeAfterStartup());
+        }
+    }
+    
+    /// <summary>
+    /// Loads the folder mode state from PlayerPrefs and restores it if it was enabled
+    /// Only restores if friendly mode is not active (friendly mode takes priority)
+    /// </summary>
+    private void LoadFolderModeState()
+    {
+        // Check if friendly mode is also saved - if so, don't restore folder mode (friendly takes priority)
+        int savedFriendlyMode = PlayerPrefs.GetInt("IsFriendlyMode", 0);
+        if (savedFriendlyMode == 1)
+        {
+            Debug.Log("[TRACKQUEUE] Friendly mode is saved, skipping folder mode restoration (friendly takes priority)");
+            HubLogger.Log("Friendly mode is saved, skipping folder mode restoration", LogCategory.System);
+            // Clear folder mode state since friendly mode takes priority
+            activeFolderMode = 0;
+            SaveFolderModeState();
+            return;
+        }
+        
+        int savedFolderMode = PlayerPrefs.GetInt("ActiveFolderMode", 0);
+        
+        Debug.Log($"[TRACKQUEUE] Loaded folder mode state from previous session: {savedFolderMode}");
+        HubLogger.Log($"Loaded folder mode state: {savedFolderMode}", LogCategory.System);
+        
+        if (savedFolderMode > 0 && savedFolderMode <= 4)
+        {
+            // Wait a moment for everything to initialize, then start folder mode
+            StartCoroutine(RestoreFolderModeAfterStartup(savedFolderMode));
+        }
+    }
+    
+    /// <summary>
+    /// Restores folder mode after startup initialization completes
+    /// </summary>
+    private IEnumerator RestoreFolderModeAfterStartup(int folderNumber)
+    {
+        // Wait for MongoDB and other systems to initialize
+        yield return new WaitForSeconds(5f);
+        
+        // Check if folder still exists
+        string folderPath = PlayerPrefs.GetString($"Folder{folderNumber}Path", "");
+        if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+        {
+            Debug.LogWarning($"[TRACKQUEUE] Folder {folderNumber} no longer exists, cannot restore folder mode");
+            HubLogger.LogWarning($"Folder {folderNumber} no longer exists, cannot restore folder mode", LogCategory.Files);
+            activeFolderMode = 0;
+            SaveFolderModeState(); // Update saved state
+            yield break;
+        }
+        
+        Debug.Log($"[TRACKQUEUE] Restoring folder {folderNumber} mode from previous session");
+        HubLogger.Log($"Restoring folder {folderNumber} mode from previous session", LogCategory.Queue);
+        albumManager.UpdateDebugText($"Restoring folder {folderNumber} mode from previous session...");
+        
+        // Start folder mode automatically (this will clear tracklist and start fresh)
+        StartFolderMode(folderNumber);
+    }
+    
+    /// <summary>
+    /// Restores friendly mode after startup initialization completes
+    /// </summary>
+    private IEnumerator RestoreFriendlyModeAfterStartup()
+    {
+        // Wait for MongoDB and other systems to initialize
+        // Wait longer to ensure tracklist loading is complete
+        yield return new WaitForSeconds(5f);
+        
+        // Check if friendly folder still exists
+        string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+        if (string.IsNullOrEmpty(friendlyFolderPath) || !Directory.Exists(friendlyFolderPath))
+        {
+            Debug.LogWarning("[TRACKQUEUE] Friendly folder no longer exists, cannot restore friendly mode");
+            HubLogger.LogWarning("Friendly folder no longer exists, cannot restore friendly mode", LogCategory.Files);
+            isFriendlyMode = false;
+            SaveFriendlyModeState(); // Update saved state
+            yield break;
+        }
+        
+        Debug.Log("[TRACKQUEUE] Restoring friendly mode from previous session");
+        HubLogger.Log("Restoring friendly mode from previous session", LogCategory.Queue);
+        albumManager.UpdateDebugText("Restoring friendly mode from previous session...");
+        
+        // Start friendly mode automatically (this will clear tracklist and start fresh)
+        StartFriendlyMode();
     }
 
     public float slaveCurrentTime = 0f;
@@ -645,10 +1351,11 @@ public class TrackQueueManager : MonoBehaviour
     {
         while (true)
         {
-            yield return new WaitForSeconds(2f); // Poll every 2 seconds
+            yield return new WaitForSeconds(5f); // Poll every 5 seconds (reduced frequency to prevent blocking)
             
-            if (mongoDBManager != null)
+            if (mongoDBManager != null && !isCheckingTracklist)
             {
+                // Fire and forget - don't await to prevent blocking
                 _ = CheckForTracklistUpdates();
             }
         }
@@ -656,6 +1363,14 @@ public class TrackQueueManager : MonoBehaviour
 
     private async Task CheckForTracklistUpdates()
     {
+        // Prevent concurrent calls
+        if (isCheckingTracklist)
+        {
+            return;
+        }
+        
+        isCheckingTracklist = true;
+        
         try
         {
             // Check if there's a song that should be playing but isn't
@@ -677,6 +1392,11 @@ public class TrackQueueManager : MonoBehaviour
         catch (Exception ex)
         {
             Debug.LogError($"Error checking tracklist updates: {ex.Message}");
+            HubLogger.LogFailure($"Error checking tracklist updates: {ex.Message}", LogCategory.Queue);
+        }
+        finally
+        {
+            isCheckingTracklist = false;
         }
     }
 
@@ -876,24 +1596,63 @@ public class TrackQueueManager : MonoBehaviour
         // Show loading for WebSocket song addition
         ShowLoading(websocketLoadingPrefab, $"Receiving song: {update.songTitle}");
         
-        // Find the song in albums and add to Unity queue
+        // Find the song and add to Unity queue
         if (albumManager != null)
+        {
+            string audioPath = null;
+            int audioLength = 180;
+            
+            // Check if this is a friendly song or if we're in friendly mode
+            bool isFriendlySong = update.album == "Friendly Songs" || isFriendlyMode;
+            
+            if (isFriendlySong)
+            {
+                // Search in friendly songs folder
+                string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+                if (!string.IsNullOrEmpty(friendlyFolderPath) && Directory.Exists(friendlyFolderPath))
+                {
+                    string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+                    var filesInFolder = Directory.GetFiles(friendlyFolderPath)
+                        .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                        .ToList();
+                    
+                    // Try to find the file by matching the song title
+                    audioPath = filesInFolder.FirstOrDefault(f => 
+                        Path.GetFileNameWithoutExtension(f).Equals(update.songTitle, StringComparison.OrdinalIgnoreCase) ||
+                        Path.GetFileNameWithoutExtension(f).Contains(update.songTitle) ||
+                        update.songTitle.Contains(Path.GetFileNameWithoutExtension(f)));
+                    
+                    if (!string.IsNullOrEmpty(audioPath))
+                    {
+                        audioLength = albumManager.GetAudioFileLength(audioPath);
+                        HubLogger.Log($"Found friendly song in WebSocket update: {update.songTitle}", LogCategory.Queue);
+                    }
+                }
+            }
+            
+            // If not found in friendly folder or not a friendly song, try regular albums
+            if (string.IsNullOrEmpty(audioPath))
         {
             string albumPath = albumManager.FindAlbumFolder(update.album);
             if (!string.IsNullOrEmpty(albumPath))
             {
-                string audioPath = albumManager.FindSongFilePath(albumPath, update.songTitle);
+                    audioPath = albumManager.FindSongFilePath(albumPath, update.songTitle);
                 if (!string.IsNullOrEmpty(audioPath))
                 {
-                    int audioLength = albumManager.GetAudioFileLength(audioPath);
+                        audioLength = albumManager.GetAudioFileLength(audioPath);
+                    }
+                }
+            }
                     
+            if (!string.IsNullOrEmpty(audioPath))
+            {
                     // Create MongoDBModels.SongDocument for the song
                     var mongoSong = new MongoDBModels.SongDocument
                     {
                         Id = update.songId ?? System.Guid.NewGuid().ToString(),
                         Title = update.songTitle,
                         Album = update.album,
-                        FamilyFriendly = true
+                    FamilyFriendly = isFriendlySong
                     };
                     
                     // Use AddSongToQueueWithPathAndMongoDB to follow the same path as manual input
@@ -908,15 +1667,12 @@ public class TrackQueueManager : MonoBehaviour
                     ));
                     
                     Debug.Log($"[TRACKQUEUE] Added song from WebSocket: {update.songTitle}");
+                HubLogger.LogSuccess($"Added song from WebSocket: {update.songTitle}", LogCategory.Queue);
                 }
                 else
                 {
                     Debug.LogWarning($"[TRACKQUEUE] Audio file not found for WebSocket song: {update.songTitle}");
-                }
-            }
-            else
-            {
-                Debug.LogWarning($"[TRACKQUEUE] Album not found for WebSocket song: {update.album}");
+                HubLogger.LogFailure($"Audio file not found for WebSocket song: {update.songTitle}", LogCategory.Files);
             }
         }
         
@@ -1710,14 +2466,49 @@ public class TrackQueueManager : MonoBehaviour
 
     public IEnumerator AddSongToQueueByName(string songFileName, float length = 0f, bool isFromSlave = false)
     {
-        Debug.Log($"[TRACKQUEUE] AddSongToQueueByName called - Song: {songFileName}, Length: {length}, FromSlave: {isFromSlave}");
+        Debug.Log($"[TRACKQUEUE] AddSongToQueueByName called - Song: {songFileName}, Length: {length}, FromSlave: {isFromSlave}, FriendlyMode: {isFriendlyMode}");
+        HubLogger.Log($"Adding song by name: {songFileName} (FriendlyMode: {isFriendlyMode})", LogCategory.Queue);
         albumManager.UpdateDebugText($"Trying to add song: {songFileName}");
 
-        // Use lazy path resolution - search for the song in album folders
+        // Use lazy path resolution - search for the song
         string fullPath = null;
         
-        // First try to find in album folders using AlbumManager
-        if (albumManager != null && !string.IsNullOrEmpty(albumManager.AlbumBasePath))
+        // If in friendly mode, search friendly folder FIRST
+        if (isFriendlyMode)
+        {
+            string friendlyFolderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
+            if (!string.IsNullOrEmpty(friendlyFolderPath) && Directory.Exists(friendlyFolderPath))
+            {
+                Debug.Log($"[TRACKQUEUE] Friendly mode - searching for song '{songFileName}' in friendly folder...");
+                HubLogger.Log($"Searching friendly folder for: {songFileName}", LogCategory.Files);
+                
+                string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+                var filesInFolder = Directory.GetFiles(friendlyFolderPath)
+                    .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                    .ToList();
+                
+                // Try exact match first
+                fullPath = filesInFolder.FirstOrDefault(f => 
+                    Path.GetFileNameWithoutExtension(f).Equals(songFileName, StringComparison.OrdinalIgnoreCase));
+                
+                // Try partial match if exact not found
+                if (string.IsNullOrEmpty(fullPath))
+                {
+                    fullPath = filesInFolder.FirstOrDefault(f => 
+                        Path.GetFileNameWithoutExtension(f).Contains(songFileName) ||
+                        songFileName.Contains(Path.GetFileNameWithoutExtension(f)));
+                }
+                
+                if (!string.IsNullOrEmpty(fullPath))
+                {
+                    Debug.Log($"[TRACKQUEUE] Found song in friendly folder: {fullPath}");
+                    HubLogger.LogSuccess($"Found in friendly folder: {Path.GetFileName(fullPath)}", LogCategory.Files);
+                }
+            }
+        }
+        
+        // If not found in friendly folder (or not in friendly mode), try regular album folders
+        if (string.IsNullOrEmpty(fullPath) && albumManager != null && !string.IsNullOrEmpty(albumManager.AlbumBasePath))
         {
             Debug.Log($"[TRACKQUEUE] Searching for song '{songFileName}' in album folders...");
             var albumFolders = Directory.GetDirectories(albumManager.AlbumBasePath);
@@ -1729,24 +2520,20 @@ public class TrackQueueManager : MonoBehaviour
                 {
                     fullPath = foundPath;
                     Debug.Log($"[TRACKQUEUE] Found song in album folder: {fullPath}");
+                    HubLogger.LogSuccess($"Found in album folder: {fullPath}", LogCategory.Files);
                     break;
                 }
             }
         }
         
-        // Fallback to old method if not found in album folders
-        if (string.IsNullOrEmpty(fullPath))
+        // Final fallback - try friendly folder if not in friendly mode (for backward compatibility)
+        if (string.IsNullOrEmpty(fullPath) && !isFriendlyMode)
         {
-            Debug.Log($"[TRACKQUEUE] Song not found in album folders, trying old method...");
+            Debug.Log($"[TRACKQUEUE] Song not found in album folders, trying friendly folder as fallback...");
         string folderPath = PlayerPrefs.GetString("FriendlyAlbumsPath", "");
 
-        if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+            if (!string.IsNullOrEmpty(folderPath) && Directory.Exists(folderPath))
         {
-                Debug.LogError($"[TRACKQUEUE] FriendlyAlbumsPath is invalid or does not exist: {folderPath}");
-            albumManager.UpdateDebugText("FriendlyAlbumsPath is invalid or does not exist.");
-            yield break;
-        }
-
         string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
 
             // First try to find in root folder (for backward compatibility)
@@ -1763,6 +2550,7 @@ public class TrackQueueManager : MonoBehaviour
                 fullPath = allFiles.FirstOrDefault(f =>
                     Path.GetFileName(f).Equals(songFileName, StringComparison.OrdinalIgnoreCase) &&
                     supportedExtensions.Contains(Path.GetExtension(f).ToLower()));
+                }
             }
         }
 
@@ -2323,8 +3111,20 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
             audioSource.Play();
 
             // Update time display during playback
+            float playbackStartTime = Time.time;
+            float maxPlaybackTime = clip.length + 10f; // Safety timeout: song length + 10 seconds
+            
             while (audioSource.isPlaying || isPaused)
             {
+                // Safety check: prevent infinite loop if audio source gets stuck
+                if (Time.time - playbackStartTime > maxPlaybackTime)
+                {
+                    Debug.LogWarning($"[TRACKQUEUE] Playback timeout detected for {nextSong.SongName}, forcing stop");
+                    HubLogger.LogWarning($"Playback timeout for {nextSong.SongName}, forcing stop", LogCategory.Queue);
+                    audioSource.Stop();
+                    break;
+                }
+                
                 if (!isPaused)
                 {
                     UpdateUI();
@@ -2362,7 +3162,11 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
             Debug.Log($"[TRACKQUEUE] Queue count after song finished: {queueList.Count}");
         }
 
-        StopAllPlayback(); // Stop everything when queue is empty
+        // Exit the coroutine when queue is empty (don't call StopAllPlayback here as it clears the queue)
+        // The auto-add will handle adding the next song, and playback will restart when the song is added
+        isPlaying = false;
+        
+        Debug.Log("[TRACKQUEUE] PlaySongQueue finished - queue is empty");
         
         // Auto-add random song when queue becomes empty (only for master)
         if (!albumManager.isSlave && CanAutoAdd())
@@ -2497,6 +3301,14 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
     public void PlayQueue()
     {
         Debug.Log($"[TRACKQUEUE] PlayQueue called - isPlaying: {isPlaying}, queueCount: {queueList.Count}");
+        
+        // Stop any existing playback coroutine before starting a new one
+        if (playbackCoroutine != null)
+        {
+            Debug.Log("[TRACKQUEUE] Stopping existing playback coroutine before starting new one");
+            StopCoroutine(playbackCoroutine);
+            playbackCoroutine = null;
+        }
         
         if (isPlaying) 
         {
@@ -2642,6 +3454,14 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
     {
         isPlaying = false;
         isPaused = false;
+        
+        // Stop the playback coroutine if it's running
+        if (playbackCoroutine != null)
+        {
+            StopCoroutine(playbackCoroutine);
+            playbackCoroutine = null;
+        }
+        
         audioSource.Stop();
         queueList.Clear();
         albumManager.UpdateDebugText("Queue is empty. Stopping playback.");
@@ -2805,6 +3625,14 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         if (playbackCoroutine != null)
         {
             StopCoroutine(playbackCoroutine);
+            playbackCoroutine = null;
+        }
+        
+        // Stop polling coroutine
+        if (tracklistPollingCoroutine != null)
+        {
+            StopCoroutine(tracklistPollingCoroutine);
+            tracklistPollingCoroutine = null;
         }
         
         // Stop all coroutines including monitoring
@@ -2833,6 +3661,19 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         if (pauseStatus)
         {
             Debug.Log("[TRACKQUEUE] Application paused - continuing playback (no auto-pause)");
+            // Allow screen to sleep when app is paused/minimized
+            if (albumManager != null && !albumManager.isSlave)
+            {
+                Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            }
+        }
+        else
+        {
+            // App resumed - prevent sleep if needed
+            if (albumManager != null && !albumManager.isSlave)
+            {
+                Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            }
         }
         AudioListener.pause = false;
     }
@@ -2843,6 +3684,19 @@ public IEnumerator AddSongToQueueWithPath(string songName, string audioPath, flo
         if (!hasFocus)
         {
             Debug.Log("[TRACKQUEUE] Application lost focus - continuing playback (no auto-pause)");
+            // Allow screen to sleep when app loses focus/minimized
+            if (albumManager != null && !albumManager.isSlave)
+            {
+                Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            }
+        }
+        else
+        {
+            // App gained focus - allow sleep according to system settings
+            if (albumManager != null && !albumManager.isSlave)
+            {
+                Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            }
         }
         AudioListener.pause = false;
     }

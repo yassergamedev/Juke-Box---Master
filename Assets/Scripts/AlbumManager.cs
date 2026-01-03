@@ -181,7 +181,7 @@ public class AlbumManager : MonoBehaviour
             Debug.LogError($"Error loading albums from MongoDB: {ex.Message}");
         }
     }
-    public void SelectSongsFolder()
+    public async void SelectSongsFolder()
     {
         var paths = StandaloneFileBrowser.OpenFolderPanel("Select Songs Folder", "", false);
 
@@ -201,11 +201,108 @@ public class AlbumManager : MonoBehaviour
 
             PlayerPrefs.SetString("FriendlyAlbumsPath", songsFolderPath);
             Debug.Log($"Selected songs folder: {songsFolderPath}");
-            UpdateDebugText("Songs folder successfully selected.");
+            UpdateDebugText("Songs folder successfully selected. Scanning friendly songs...");
+            
+            // Scan and add friendly songs to MongoDB
+            await ScanFriendlySongs(songsFolderPath);
         }
         else
         {
             UpdateDebugText("No songs folder selected.");
+        }
+    }
+    
+    /// <summary>
+    /// Scans the friendly songs folder and adds songs to MongoDB with FamilyFriendly=true
+    /// </summary>
+    private async Task ScanFriendlySongs(string friendlyFolderPath)
+    {
+        try
+        {
+            UpdateDebugText("Scanning friendly songs folder...");
+            HubLogger.Log("Scanning friendly songs folder", LogCategory.Files);
+            
+            string[] supportedExtensions = { ".mp3", ".wav", ".ogg" };
+            var audioFiles = Directory.GetFiles(friendlyFolderPath)
+                .Where(f => supportedExtensions.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
+            
+            if (audioFiles.Count == 0)
+            {
+                UpdateDebugText("No audio files found in friendly songs folder.");
+                HubLogger.LogWarning("No audio files found in friendly songs folder", LogCategory.Files);
+                return;
+            }
+            
+            HubLogger.Log($"Found {audioFiles.Count} audio files in friendly folder", LogCategory.Files);
+            
+            // Get existing songs from MongoDB
+            var existingSongs = await mongoDBManager.GetAllSongsAsync();
+            int addedCount = 0;
+            int updatedCount = 0;
+            
+            // Create a virtual "Friendly Songs" album for organization
+            string friendlyAlbumName = "Friendly Songs";
+            string friendlyArtist = "Various Artists";
+            
+            // Check if album exists, create if not
+            var existingAlbums = await mongoDBManager.GetAllAlbumsAsync();
+            var friendlyAlbum = existingAlbums.FirstOrDefault(a => a.Title == friendlyAlbumName);
+            if (friendlyAlbum == null)
+            {
+                await mongoDBManager.AddAlbumAsync(friendlyAlbumName, friendlyArtist);
+                HubLogger.LogSuccess($"Created friendly album: {friendlyAlbumName}", LogCategory.Albums);
+            }
+            
+            // Process each audio file
+            foreach (var audioFile in audioFiles)
+            {
+                string songTitle = GetSongTitle(audioFile);
+                if (string.IsNullOrEmpty(songTitle))
+                {
+                    songTitle = Path.GetFileNameWithoutExtension(audioFile);
+                }
+                
+                // Check if song already exists
+                var existingSong = existingSongs.FirstOrDefault(s => 
+                    s.Title == songTitle && s.Album == friendlyAlbumName);
+                
+                if (existingSong == null)
+                {
+                    // New song - add with FamilyFriendly=true
+                    bool added = await mongoDBManager.AddSongAsync(
+                        songTitle, 
+                        friendlyArtist, 
+                        friendlyAlbumName, 
+                        familyFriendly: true
+                    );
+                    if (added)
+                    {
+                        addedCount++;
+                        HubLogger.LogSuccess($"Added friendly song: {songTitle}", LogCategory.Files);
+                    }
+                }
+                else if (!existingSong.FamilyFriendly)
+                {
+                    // Song exists but not marked as friendly - update it
+                    bool updated = await mongoDBManager.UpdateSongFamilyFriendlyAsync(existingSong.Id, true);
+                    if (updated)
+                    {
+                        updatedCount++;
+                        HubLogger.LogSuccess($"Updated song to friendly: {songTitle}", LogCategory.Files);
+                    }
+                }
+            }
+            
+            UpdateDebugText($"Friendly songs scan complete. Added: {addedCount}, Updated: {updatedCount}");
+            HubLogger.LogSuccess($"Friendly songs scan complete - Added: {addedCount}, Updated: {updatedCount}", LogCategory.Files);
+        }
+        catch (Exception ex)
+        {
+            string errorMsg = $"Error scanning friendly songs: {ex.Message}";
+            UpdateDebugText(errorMsg);
+            HubLogger.LogFailure(errorMsg, LogCategory.Files);
+            Debug.LogError($"[ALBUM_MANAGER] {errorMsg}");
         }
     }
 

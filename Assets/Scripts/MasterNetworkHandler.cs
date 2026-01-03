@@ -7,6 +7,8 @@ using UnityEngine.UI;
 using System.Collections.Generic;
 using System;
 using System.Threading.Tasks;
+using System.IO;
+using System.Collections;
 
 public class MasterNetworkHandler : MonoBehaviour
 {
@@ -18,7 +20,7 @@ public class MasterNetworkHandler : MonoBehaviour
     public Button setPortButton;
     public Text statusText;
     public Text receivedRequestText;
-
+    
     private TcpListener server;
     private bool isRunning = false;
     private List<TcpClient> connectedClients = new List<TcpClient>(); 
@@ -50,6 +52,18 @@ public class MasterNetworkHandler : MonoBehaviour
         {
             setPortButton.onClick.AddListener(SetPortAndStartServer);
         }
+
+        // Auto-start TCP server if this is the master/hub (not a slave)
+        if (albumManager != null && !albumManager.isSlave)
+        {
+            Debug.Log("[MASTER_TCP] Master instance detected - starting TCP server automatically");
+            HubLogger.Log("Hub starting - Initializing TCP server...", LogCategory.TCP);
+            StartServer();
+        }
+        else
+        {
+            Debug.Log("[MASTER_TCP] Slave instance detected - TCP server will not start automatically");
+        }
     }
 
     private void SetPortAndStartServer()
@@ -70,7 +84,9 @@ public class MasterNetworkHandler : MonoBehaviour
     {
         if (isRunning)
         {
-            UpdateStatusText("Server is already running. Restart the application to change the port.");
+            string message = "Server is already running. Restart the application to change the port.";
+            UpdateStatusText(message);
+            HubLogger.LogWarning(message, LogCategory.TCP);
             return;
         }
 
@@ -79,13 +95,17 @@ public class MasterNetworkHandler : MonoBehaviour
             server = new TcpListener(IPAddress.Any, port);
             server.Start();
             isRunning = true;
-            UpdateStatusText($"Server listening on port {port}...");
+            string successMessage = $"TCP Server started - Listening on port {port}";
+            UpdateStatusText(successMessage);
+            HubLogger.LogSuccess(successMessage, LogCategory.TCP);
             AcceptClientsAsync();
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Failed to start server: {ex.Message}");
-            UpdateStatusText($"Failed to start server: {ex.Message}");
+            string errorMessage = $"Failed to start TCP server: {ex.Message}";
+            Debug.LogError(errorMessage);
+            UpdateStatusText(errorMessage);
+            HubLogger.LogFailure(errorMessage, LogCategory.TCP);
         }
     }
 
@@ -101,8 +121,15 @@ public class MasterNetworkHandler : MonoBehaviour
             }
 
             string clientIP = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
-            Debug.Log($"Slave Application connected from {clientIP}.");
-            UpdateStatusText($"Slave Application connected from {clientIP}.");
+            string connectionMessage = $"Slave connected from {clientIP}";
+            Debug.Log(connectionMessage);
+            UpdateStatusText(connectionMessage);
+            HubLogger.LogSuccess(connectionMessage, LogCategory.TCP);
+            
+            lock (connectedClients)
+            {
+                HubLogger.Log($"Total connected clients: {connectedClients.Count + 1}", LogCategory.TCP);
+            }
 
             lastConnectedClientIP = clientIP;
 
@@ -124,30 +151,40 @@ public class MasterNetworkHandler : MonoBehaviour
                     string request = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
                     Debug.Log($"Received request: {request}");
                     UpdateReceivedRequestText(request);
-                    HandleRequest(request);
+                    await HandleRequest(request, stream);
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Client disconnected with error: {ex.Message}");
+                string errorMessage = $"Client disconnected with error: {ex.Message}";
+                Debug.LogError(errorMessage);
+                HubLogger.LogFailure(errorMessage, LogCategory.TCP);
             }
         }
 
         lock (connectedClients)
         {
-            connectedClients.Remove(client); // Remove disconnected clienta
+            connectedClients.Remove(client); // Remove disconnected client
+            string disconnectMessage = $"Slave disconnected. Remaining clients: {connectedClients.Count}";
+            Debug.Log(disconnectMessage);
+            UpdateStatusText(disconnectMessage);
+            HubLogger.Log(disconnectMessage, LogCategory.TCP);
         }
-
-        Debug.Log("Slave Application disconnected.");
-        UpdateStatusText("Slave Application disconnected.");
     }
-    private void HandleRequest(string request)
+    private async Task HandleRequest(string request, NetworkStream stream)
     {
         string[] parts = request.Split('|');
         string command = parts[0];
 
         switch (command)
         {
+            case "PING":
+            case "HEARTBEAT":
+                // Respond to heartbeat/ping requests to verify hub is online
+                HubLogger.Log("Heartbeat received from client", LogCategory.TCP);
+                await RespondToHeartbeat(stream, parts.Length > 1 ? parts[1] : null);
+                break;
+
             case "AUTH":
                 receivedUsername = parts[1];
                 receivedPassword = parts[2];
@@ -195,8 +232,37 @@ public class MasterNetworkHandler : MonoBehaviour
                 break;
         }
     }
+
+    /// <summary>
+    /// Responds to heartbeat/ping requests from slaves to verify hub is online
+    /// </summary>
+    private async Task RespondToHeartbeat(NetworkStream stream, string optionalData = null)
+    {
+        try
+        {
+            string response = "PONG|HUB_ONLINE";
+            if (!string.IsNullOrEmpty(optionalData))
+            {
+                response += $"|{optionalData}";
+            }
+            
+            byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+            await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
+            
+            Debug.Log($"[MASTER_TCP] Responded to heartbeat: {response}");
+            HubLogger.LogSuccess($"Heartbeat response sent: {response}", LogCategory.TCP);
+        }
+        catch (Exception ex)
+        {
+            string errorMessage = $"Failed to respond to heartbeat: {ex.Message}";
+            Debug.LogError($"[MASTER_TCP] {errorMessage}");
+            HubLogger.LogFailure(errorMessage, LogCategory.TCP);
+        }
+    }
+
     private void UpdateStatusText(string message)
     {
+        // UI updates are safe from async methods in Unity as they run on main thread context
         if (statusText != null)
         {
             statusText.text = message;
@@ -206,6 +272,7 @@ public class MasterNetworkHandler : MonoBehaviour
 
     private void UpdateReceivedRequestText(string request)
     {
+        // UI updates are safe from async methods in Unity as they run on main thread context
         if (receivedRequestText != null)
         {
             receivedRequestText.text = $"Received: {request}";

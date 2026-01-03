@@ -5,6 +5,7 @@ using MongoDB.Bson.Serialization.Attributes;
 namespace MongoDBModels
 {
     [Serializable]
+    [BsonIgnoreExtraElements]
     public class AlbumDocument
     {
         [BsonId]
@@ -19,6 +20,7 @@ namespace MongoDBModels
     }
 
     [Serializable]
+    [BsonIgnoreExtraElements]
     public class SongDocument
     {
         [BsonId]
@@ -39,6 +41,7 @@ namespace MongoDBModels
     }
 
     [Serializable]
+    [BsonIgnoreExtraElements]
     public class TracklistEntryDocument
     {
         [BsonId]

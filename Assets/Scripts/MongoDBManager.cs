@@ -54,10 +54,12 @@ public class MongoDBManager : MonoBehaviour
             tracklistCollection = database.GetCollection<TracklistEntryDocument>("tracklist");
 
             Debug.Log("MongoDB connection initialized successfully");
+            HubLogger.LogSuccess("MongoDB connection initialized", LogCategory.MongoDB);
         }
         catch (Exception ex)
         {
             Debug.LogError($"Failed to initialize MongoDB: {ex.Message}");
+            HubLogger.LogFailure($"MongoDB initialization failed: {ex.Message}", LogCategory.MongoDB);
         }
     }
 
@@ -66,11 +68,14 @@ public class MongoDBManager : MonoBehaviour
     {
         try
         {
-            return await albumsCollection.Find(_ => true).ToListAsync();
+            var albums = await albumsCollection.Find(_ => true).ToListAsync();
+            HubLogger.Log($"Retrieved {albums.Count} albums from MongoDB", LogCategory.MongoDB);
+            return albums;
         }
         catch (Exception ex)
         {
             Debug.LogError($"Error getting albums: {ex.Message}");
+            HubLogger.LogFailure($"Failed to get albums: {ex.Message}", LogCategory.MongoDB);
             return new List<AlbumDocument>();
         }
     }
@@ -88,11 +93,13 @@ public class MongoDBManager : MonoBehaviour
             
             await albumsCollection.InsertOneAsync(album);
             Debug.Log($"Added new album to MongoDB: {title} by {artist}");
+            HubLogger.LogSuccess($"Added album: {title} by {artist}", LogCategory.MongoDB);
             return true;
         }
         catch (Exception ex)
         {
             Debug.LogError($"Error adding album: {ex.Message}");
+            HubLogger.LogFailure($"Failed to add album {title}: {ex.Message}", LogCategory.MongoDB);
             return false;
         }
     }
@@ -295,11 +302,13 @@ public class MongoDBManager : MonoBehaviour
 
             await tracklistCollection.InsertOneAsync(TracklistEntryDocument);
             Debug.Log($"Added song to tracklist: {title} by {artist}");
+            HubLogger.LogSuccess($"Added to tracklist: {title} by {artist}", LogCategory.Queue);
             return TracklistEntryDocument;
         }
         catch (Exception ex)
         {
             Debug.LogError($"Error adding song to tracklist: {ex.Message}");
+            HubLogger.LogFailure($"Failed to add {title} to tracklist: {ex.Message}", LogCategory.Queue);
             return null;
         }
     }
